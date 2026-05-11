@@ -10,7 +10,7 @@ other share holder.
 ## Build
 
 ```sh
-go build ./cmd/clawdwallet
+go build .
 ```
 
 ## Commands
@@ -31,7 +31,7 @@ clawdwallet mcp        Speak MCP (JSON-RPC 2.0) on stdio
 ## Module layout
 
 ```text
-cmd/clawdwallet/         CLI entry
+main.go                  CLI entry
 internal/cli/            subcommand wiring (one file per command)
 internal/agent/          runtime: Spot client, TSS session bridge,
                          keygen/sign/reshare, transfer + x402 payer
