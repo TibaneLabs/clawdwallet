@@ -1,10 +1,8 @@
 # clawdwallet
 
 Agent-side CLI for the **ClawdWallet** TSS custody wallet for AI agents on
-Solana. The full architecture lives in
-[`../hackaton/ARCHITECTURE.md`](../hackaton/ARCHITECTURE.md); this binary is the
-"Agent Process" box in that diagram — the party that holds **Share 1** of a
-2-of-3 EdDSA threshold signature, talks to the Policy Evaluator and Owner
+Solana. This binary is the "Agent Process" — the party that holds **Share 1**
+of a 2-of-3 EdDSA threshold signature, talks to the Policy Evaluator and Owner
 Mobile over [Spot](https://github.com/KarpelesLab/spotlib), and builds Solana
 transactions that can never be signed without cooperation from at least one
 other share holder.
@@ -47,10 +45,10 @@ internal/mcp/            JSON-RPC 2.0 MCP server over stdin/stdout
 
 ## TSS-over-Spot bridge
 
-`spotlib` only routes by the first path segment of an endpoint, so the
-architecture's `walletsign/<sid>/init` and `walletsign/<sid>/broadcast` are
-multiplexed onto a single `wallet` Spot endpoint. The envelope carries the
-sub-action and session id:
+`spotlib` only routes by the first path segment of an endpoint, so all
+TSS ceremony traffic (init + per-round broadcast, for keygen / signing /
+reshare) is multiplexed onto a single `wallet` Spot endpoint. The envelope
+carries the sub-action and session id:
 
 ```json
 {
@@ -71,8 +69,9 @@ into a `BroadcastPayload`, and sent to each peer (`SendTo(target, body)` with
 Wired and exercised in unit tests (`go test ./...`):
 
 - Solana address derivation from a 32-byte EdDSA pubkey.
-- The `TransferChecked` (index 12) instruction — the architecture flags this
-  as a required gap in `outscript`; this package fills it.
+- The `TransferChecked` (index 12) SPL Token instruction, required by the
+  x402 "exact" scheme on Solana and not (yet) exported by `outscript`; this
+  package fills the gap.
 - `MessageBytes` / `AttachSignature` helpers so a TSS-produced signature can be
   attached to a tx without going through `outscript.SolanaTx.Sign` (which
   requires the private key directly).
@@ -80,12 +79,11 @@ Wired and exercised in unit tests (`go test ./...`):
   computes the same canonical ordering.
 
 Wired and ready for a live Spot relay + a real Policy Evaluator + an Owner Mobile
-peer, but not unit-tested in this hackathon cut:
+peer, but not yet unit-tested end-to-end:
 
 - Keygen, signing, and reshare ceremonies via `tss-lib/v2` `eddsa.{keygen,
   signing, resharing}.LocalParty`.
-- Policy evaluator request envelope (`policy/sign-request` schema from the
-  architecture doc).
+- Policy evaluator request envelope (`policy/sign-request`).
 - x402 client (parses `X-PAYMENT-REQUIRED`, asks the agent for a signed tx,
   retries with `X-PAYMENT`).
 - MCP stdio server with `get_address`, `get_status`, `get_balance`, `transfer`,

@@ -18,8 +18,8 @@ var SolanaTokenProgram = mustParse("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 // decimals match the source account, which prevents a class of confused-deputy
 // bugs against the simpler Transfer (index 3) instruction.
 //
-// outscript exposes Transfer (index 3) but not TransferChecked; the architecture
-// doc flags this as a required gap. This function fills it.
+// outscript exposes Transfer (index 3) but not TransferChecked, so this
+// function fills the gap.
 //
 //	source       -- the sender's associated token account (ATA)
 //	mint         -- the token mint (e.g. USDC mint)

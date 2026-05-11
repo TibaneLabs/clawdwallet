@@ -11,8 +11,8 @@ import (
 	"github.com/KarpelesLab/spotlib"
 )
 
-// SignRequest is sent on policy/sign-request. The shape mirrors the schema in
-// ARCHITECTURE.md (the full JSON envelope the policy evaluator inspects).
+// SignRequest is sent on policy/sign-request. It carries the raw transaction
+// plus structured context the policy evaluator inspects before agreeing to co-sign.
 type SignRequest struct {
 	RequestID     string         `json:"request_id"`
 	TxBytes       string         `json:"tx_bytes"` // base64
