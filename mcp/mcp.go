@@ -14,8 +14,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/TibaneLabs/clawdwallet/internal/agent"
-	"github.com/TibaneLabs/clawdwallet/internal/policy"
+	"github.com/TibaneLabs/clawdwallet/agent"
+	"github.com/TibaneLabs/clawdwallet/policy"
 )
 
 const (

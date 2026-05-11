@@ -7,9 +7,9 @@ import (
 
 	"github.com/KarpelesLab/outscript"
 
-	"github.com/TibaneLabs/clawdwallet/internal/policy"
-	"github.com/TibaneLabs/clawdwallet/internal/solana"
-	"github.com/TibaneLabs/clawdwallet/internal/x402"
+	"github.com/TibaneLabs/clawdwallet/policy"
+	"github.com/TibaneLabs/clawdwallet/solana"
+	"github.com/TibaneLabs/clawdwallet/x402"
 )
 
 // X402Payer adapts the agent to x402.Payer, producing a signed TransferChecked

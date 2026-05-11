@@ -1,4 +1,4 @@
-package cli
+package main
 
 import (
 	"context"
@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/TibaneLabs/clawdwallet/internal/agent"
-	"github.com/TibaneLabs/clawdwallet/internal/config"
-	"github.com/TibaneLabs/clawdwallet/internal/x402"
+	"github.com/TibaneLabs/clawdwallet/agent"
+	"github.com/TibaneLabs/clawdwallet/config"
+	"github.com/TibaneLabs/clawdwallet/x402"
 )
 
 func init() {

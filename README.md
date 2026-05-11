@@ -30,18 +30,23 @@ clawdwallet mcp        Speak MCP (JSON-RPC 2.0) on stdio
 
 ## Module layout
 
+Importable packages — every directory below can be imported by code outside
+this repo (no `internal/`):
+
 ```text
-main.go                  CLI entry
-internal/cli/            subcommand wiring (one file per command)
-internal/agent/          runtime: Spot client, TSS session bridge,
-                         keygen/sign/reshare, transfer + x402 payer
-internal/config/         ~/.config/clawdwallet/config.json
-internal/store/          encrypted gobottle holding the TSS share
-internal/solana/         JSON-RPC client, TransferChecked, sig attach helpers
-internal/policy/         policy-evaluator Spot client
-internal/x402/           HTTP 402 client (parses X-PAYMENT-REQUIRED)
-internal/mcp/            JSON-RPC 2.0 MCP server over stdin/stdout
+agent/      runtime: Spot client, TSS session bridge,
+            keygen/sign/reshare, transfer + x402 payer
+config/     config file shape + load/save
+store/      encrypted gobottle holding the TSS share
+solana/     JSON-RPC client, TransferChecked instruction,
+            MessageBytes / AttachSignature helpers
+policy/     policy-evaluator request schema + Spot client
+x402/       HTTP 402 client (parses X-PAYMENT-REQUIRED)
+mcp/        JSON-RPC 2.0 MCP server over stdin/stdout
 ```
+
+The repo root holds the binary itself: `main.go` plus one
+`<subcommand>.go` per CLI command (all `package main`).
 
 ## TSS-over-Spot bridge
 

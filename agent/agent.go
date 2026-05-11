@@ -25,9 +25,9 @@ import (
 	"github.com/KarpelesLab/spotlib"
 	"github.com/KarpelesLab/spotproto"
 
-	"github.com/TibaneLabs/clawdwallet/internal/config"
-	"github.com/TibaneLabs/clawdwallet/internal/solana"
-	"github.com/TibaneLabs/clawdwallet/internal/store"
+	"github.com/TibaneLabs/clawdwallet/config"
+	"github.com/TibaneLabs/clawdwallet/solana"
+	"github.com/TibaneLabs/clawdwallet/store"
 )
 
 // Agent is the central runtime. Exactly one Agent exists per process.

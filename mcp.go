@@ -1,13 +1,13 @@
-package cli
+package main
 
 import (
 	"context"
 	"os/signal"
 	"syscall"
 
-	"github.com/TibaneLabs/clawdwallet/internal/agent"
-	"github.com/TibaneLabs/clawdwallet/internal/config"
-	"github.com/TibaneLabs/clawdwallet/internal/mcp"
+	"github.com/TibaneLabs/clawdwallet/agent"
+	"github.com/TibaneLabs/clawdwallet/config"
+	"github.com/TibaneLabs/clawdwallet/mcp"
 )
 
 func init() {

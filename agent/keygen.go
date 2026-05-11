@@ -12,8 +12,8 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 	"github.com/google/uuid"
 
-	"github.com/TibaneLabs/clawdwallet/internal/solana"
-	"github.com/TibaneLabs/clawdwallet/internal/store"
+	"github.com/TibaneLabs/clawdwallet/solana"
+	"github.com/TibaneLabs/clawdwallet/store"
 )
 
 // Keygen runs a 3-party EdDSA keygen ceremony with the given peers (which

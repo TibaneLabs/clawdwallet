@@ -14,7 +14,7 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 	"github.com/google/uuid"
 
-	"github.com/TibaneLabs/clawdwallet/internal/store"
+	"github.com/TibaneLabs/clawdwallet/store"
 )
 
 // SignDigest runs a 2-of-3 TSS signing ceremony over the given 32-byte digest

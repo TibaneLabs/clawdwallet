@@ -10,8 +10,8 @@ import (
 	"github.com/KarpelesLab/outscript"
 	"github.com/google/uuid"
 
-	"github.com/TibaneLabs/clawdwallet/internal/policy"
-	"github.com/TibaneLabs/clawdwallet/internal/solana"
+	"github.com/TibaneLabs/clawdwallet/policy"
+	"github.com/TibaneLabs/clawdwallet/solana"
 )
 
 // TransferOptions is the input to BuildTransfer.
