@@ -84,15 +84,16 @@ func TestMarshalLeaderInit(t *testing.T) {
 // decoder tolerates `init_payload` AND `init` (legacy phplatform alias).
 func TestInitPayloadJSON(t *testing.T) {
 	// Verify the local InitPayload type accepts the canonical wire shape with
-	// `type` (not `kind`) and `spot_id` in peers.
+	// `type` (not `kind`) and `id` in peers (matches tss-lib's protobuf JSON
+	// tag — the same field name wdrone reads via tss.SortedPartyIDs).
 	body := []byte(`{
 		"sid": "crwsv-abc",
 		"type": "txsign",
 		"curve": "ed25519",
 		"threshold": 1,
 		"peers": [
-			{"spot_id":"k.agent","moniker":"agent","key":"AAAA"},
-			{"spot_id":"k.wdrone","moniker":"wdrone","key":"BBBB"}
+			{"id":"k.agent","moniker":"agent","key":"AAAA"},
+			{"id":"k.wdrone","moniker":"wdrone","key":"BBBB"}
 		],
 		"digest": "deadbeef"
 	}`)

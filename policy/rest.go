@@ -90,8 +90,12 @@ type InitPayload struct {
 }
 
 // PeerInit is one participant in InitPayload.Peers.
+//
+// JSON tag for SpotID is `id` to match tss-lib's MessageWrapper_PartyID
+// protobuf JSON tag — wdrone unmarshals peers directly into
+// tss.SortedPartyIDs and needs `id` populated for routing.
 type PeerInit struct {
-	SpotID  string `json:"spot_id"`
+	SpotID  string `json:"id"`
 	Moniker string `json:"moniker"`
 	Key     string `json:"key,omitempty"`
 }

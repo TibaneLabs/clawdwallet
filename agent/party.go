@@ -17,8 +17,10 @@ import (
 // .SetBytes(<raw>); when absent we fall back to a sha256(spot_id) digest so
 // older callers and standalone tests still produce a deterministic value.
 type PeerSpec struct {
-	// SpotID is the routable Spot identity (e.g. "k.<base64>").
-	SpotID string `json:"spot_id"`
+	// SpotID is the routable Spot identity (e.g. "k.<base64>"). JSON tag
+	// is `id` to match tss-lib's MessageWrapper_PartyID protobuf JSON tag,
+	// so wdrone can unmarshal peers directly into tss.SortedPartyIDs.
+	SpotID string `json:"id"`
 
 	// Moniker is the human-friendly tag carried inside the PartyID.
 	Moniker string `json:"moniker"`

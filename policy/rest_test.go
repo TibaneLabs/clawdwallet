@@ -21,8 +21,8 @@ func TestSignResponseDecode(t *testing.T) {
 			"curve": "ed25519",
 			"threshold": 1,
 			"peers": [
-				{"spot_id":"k.agent","moniker":"agent","key":"AAAA"},
-				{"spot_id":"k.wdrone","moniker":"wdrone","key":"BBBB"}
+				{"id":"k.agent","moniker":"agent","key":"AAAA"},
+				{"id":"k.wdrone","moniker":"wdrone","key":"BBBB"}
 			],
 			"digest": "3q2+7w=="
 		}
