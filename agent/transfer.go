@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -12,6 +14,26 @@ import (
 	"github.com/TibaneLabs/clawdwallet/solana"
 	"github.com/TibaneLabs/clawdwallet/store"
 )
+
+// encodeParsedEffects packs the policy-relevant context (intent, parsed
+// effects, optional x402 hint) into the JSON blob phplatform's
+// `WalletSign:signByPolicy` reads as `object`. The policy engine's
+// `agent_skill` Kind reads `token_deltas[].amount_usd` and `recipient` for
+// hard-rules evaluation; the other fields are informational.
+func encodeParsedEffects(intent policy.Intent, parsed policy.ParsedEffects, x402 *policy.X402Context) ([]byte, error) {
+	return json.Marshal(struct {
+		Intent        policy.Intent        `json:"intent"`
+		ParsedEffects policy.ParsedEffects `json:"parsed_effects"`
+		X402Context   *policy.X402Context  `json:"x402_context,omitempty"`
+		// The Stage-1 evaluator looks for token_deltas at the top level too.
+		TokenDeltas []policy.TokenDelta `json:"token_deltas"`
+	}{
+		Intent:        intent,
+		ParsedEffects: parsed,
+		X402Context:   x402,
+		TokenDeltas:   parsed.TokenDeltas,
+	})
+}
 
 // base64URLEncode is a local alias used when assembling InitPayload-style
 // peer key fields (raw bytes → base64url).
@@ -107,12 +129,19 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 	if err != nil {
 		return "", fmt.Errorf("build tx: %w", err)
 	}
-	rawTx, err := serializeUnsigned(tx)
+
+	msgBytes, err := solana.MessageBytes(tx)
 	if err != nil {
 		return "", err
 	}
+	hashHex := hex.EncodeToString(msgBytes)
 
-	resp, err := policy.Submit(ctx, sh.WalletID, rawTx, opts.Intent, parsed)
+	parsedJSON, err := encodeParsedEffects(opts.Intent, parsed, opts.X402)
+	if err != nil {
+		return "", fmt.Errorf("encode parsed_effects: %w", err)
+	}
+
+	resp, err := policy.Submit(ctx, sh.WalletID, hashHex, parsedJSON)
 	if err != nil {
 		return "", fmt.Errorf("policy submit: %w", err)
 	}
@@ -128,15 +157,6 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 	// bytes per peer) over the bare spot-id list. Falls back to share-derived
 	// peers when neither shape is present.
 	signers, err := a.resolveSigners(resp, sh)
-	if err != nil {
-		return "", err
-	}
-
-	// Compute the digest the TSS round will sign over. For Solana that's the
-	// raw message bytes (NOT a pre-hashed pre-image): tss-lib's EdDSA signing
-	// takes the message as a big.Int and treats it directly so the resulting
-	// signature verifies under stdlib ed25519.Verify.
-	msgBytes, err := solana.MessageBytes(tx)
 	if err != nil {
 		return "", err
 	}
@@ -184,24 +204,6 @@ func (a *Agent) resolveSigners(resp *policy.SignResponse, sh *store.Share) ([]Pe
 		return out, nil
 	}
 
-	if resp != nil && len(resp.Peers) > 0 {
-		out := make([]PeerSpec, 0, len(resp.Peers))
-		for _, id := range resp.Peers {
-			moniker := "peer"
-			if id == mySpot {
-				moniker = a.cfg.Moniker
-			}
-			ps := PeerSpec{SpotID: id, Moniker: moniker}
-			// Best effort: lift the canonical key bytes from our share's
-			// recorded peer keys so the bigint slot matches wdrone's. The
-			// shared PartyID.Key fallback (sha256) would otherwise diverge
-			// from wdrone's raw-pubkey derivation.
-			ps.Key = a.shareKeyFor(sh, id)
-			out = append(out, ps)
-		}
-		return out, nil
-	}
-
 	if len(sh.PeerSpotIDs) == 0 {
 		return nil, errors.New("no signer peers known")
 	}
@@ -238,18 +240,3 @@ func (a *Agent) shareKeyFor(sh *store.Share, spotID string) string {
 	return ""
 }
 
-// serializeUnsigned returns the wire form of a tx with empty signature slots.
-// We use it as a stand-in TxBytes for the policy evaluator's parsed_effects
-// verification step.
-func serializeUnsigned(tx *outscript.SolanaTx) ([]byte, error) {
-	n := solana.NumRequiredSignatures(tx)
-	if cap(tx.Signatures) < n {
-		tx.Signatures = make([][]byte, n)
-	}
-	for i := 0; i < n; i++ {
-		if len(tx.Signatures[i]) == 0 {
-			tx.Signatures[i] = make([]byte, 64)
-		}
-	}
-	return tx.MarshalBinary()
-}

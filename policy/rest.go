@@ -14,53 +14,62 @@ import (
 // through encoding/json without naming-import clashes.
 var jsonUnmarshal = json.Unmarshal
 
-// SignRequest is the JSON body of `POST Crypto/ClawdWallet/<walletID>:signRequest`.
+// SignRequest is the JSON body of `POST Crypto/WalletSign:signByPolicy`.
+//
+// The phplatform endpoint expects the legacy WalletSign signing-flow shape:
+// `key`, `hash`, `object_type`, `object`, `il`, `curve`. For ClawdWallet
+// agent-type wallets, the policy engine reads `object` (the JSON of the
+// agent's parsed_effects) to apply hard rules; `hash` is the hex-encoded
+// Solana message bytes that ultimately get signed by the TSS ceremony.
 type SignRequest struct {
-	TxBytes       string         `json:"tx_bytes"` // base64
-	TxType        string         `json:"tx_type"`
-	Intent        Intent         `json:"intent"`
-	ParsedEffects ParsedEffects  `json:"parsed_effects"`
-	X402Context   *X402Context   `json:"x402_context,omitempty"`
+	Key        string `json:"key"`              // <crws-id>:<crwsv-id> (the wallet handle libwallet stored on keygen)
+	Hash       string `json:"hash"`             // hex of Solana message bytes
+	ObjectType string `json:"object_type"`      // e.g. "solana_tx"
+	Object     string `json:"object"`           // JSON of parsed_effects + intent + x402 context
+	IL         string `json:"il,omitempty"`     // not used for EdDSA
+	Curve      string `json:"curve"`            // "ed25519"
 }
 
-// SignResponse is the decoded `Crypto/ClawdWallet/<walletID>:signRequest` reply.
+// SignResponse is the decoded `Crypto/WalletSign:signByPolicy` reply.
 //
 //	{
-//	  "remote_key": "<crws>:<crwsv>",
-//	  "approved":   bool,
-//	  "reason":     "<text>",
-//	  "peers":      ["k.<base64>", ...],
-//	  "init_payload": { sid, type, curve, threshold, peers, digest }
+//	  "session":      "<crwsv-id>",
+//	  "format":       "all-digits",
+//	  "length":       6,
+//	  "remote_key":   "<crws>:<crwsv>",
+//	  "wdrone_spot_id": "k.<base64>",
+//	  "init_payload": { type, curve, threshold, peers, digest }
 //	}
 //
 // `RemoteKey` is the canonical `Crypto_WalletSign__:Crypto_WalletSign_Verify__`
-// pair (matches `Crypto/WalletSign:verify`). The crwsv- portion is the session
-// id the agent uses for the TSS round path; we expose it as `SessionID` for
-// convenience.
+// pair. The crwsv- portion is the session id the agent uses for the TSS round
+// path; exposed as `SessionID` for convenience.
 //
-// `InitPayload` carries the full agent→wdrone init body per the Stage-1
-// integration contract. The phplatform stub may omit it (older builds), in
-// which case BuildAndPay synthesizes a minimal init from `Peers` + the local
-// digest. Field name verification with the policy module is the remaining
-// open item: legacy phplatform agent output called this field `init`; both
-// are tolerated via UnmarshalJSON below.
+// `InitPayload` carries the canonical agent→wdrone init body. The phplatform
+// endpoint produces it for agent-type wallets; for legacy user-type wallets
+// (signed locally via libwallet, no wdrone) the field is absent and a
+// successful response just means the legacy SMS-free auto-policy path
+// validated. ClawdWallet always uses agent-type so InitPayload is expected.
+//
+// `Approved` is synthesised: a successful response (no HTTP error) implies
+// the policy approved. The phplatform endpoint throws on rejection, so the
+// presence of a session in the response is itself the approval signal.
 type SignResponse struct {
-	RemoteKey string `json:"remote_key"`
-	Approved  bool   `json:"approved"`
-	Reason    string `json:"reason,omitempty"`
+	Session      string `json:"session"`
+	RemoteKey    string `json:"remote_key"`
+	WdroneSpotID string `json:"wdrone_spot_id,omitempty"`
 
-	// Peers is the co-signer set for the sign ceremony, returned by the policy
-	// module so the agent doesn't have to look it up separately. Each entry is
-	// a Spot id; the agent itself is included. Two transport shapes are
-	// accepted: a bare list of spot ids (legacy) or an array of
-	// {spot_id,moniker,key} records (canonical Stage-1 shape carried inside
-	// InitPayload). When the latter is used the bare `peers` array MAY also
-	// be present for callers that only need the spot ids.
-	Peers []string `json:"peers,omitempty"`
-
-	// InitPayload is the canonical agent-leader-to-wdrone init body for the
-	// sign ceremony. Optional — see UnmarshalJSON.
+	// InitPayload is the canonical sign-ceremony init body. Absent for legacy
+	// user-type wallets (they sign locally without wdrone).
 	InitPayload *InitPayload `json:"init_payload,omitempty"`
+
+	// Approved is true whenever the call succeeded (phplatform throws on
+	// rejection). Kept as a field for caller ergonomics.
+	Approved bool `json:"-"`
+
+	// Reason carries any wrapping error text the caller surfaces. Phplatform
+	// errors surface via the rest.Apply error path, not this field.
+	Reason string `json:"-"`
 }
 
 // InitPayload is the policy-issued sign-ceremony init body. The agent
@@ -87,31 +96,24 @@ type PeerInit struct {
 	Key     string `json:"key,omitempty"`
 }
 
-// UnmarshalJSON tolerates the `init` field name alongside the canonical
-// `init_payload`. The phplatform integration agent is still settling on the
-// exact name; the agent accepts either rather than gating on a specific one.
+// UnmarshalJSON decodes the phplatform response and synthesises `Approved`
+// from the presence of a session id (phplatform throws on rejection).
 func (r *SignResponse) UnmarshalJSON(data []byte) error {
 	type raw struct {
+		Session      string       `json:"session"`
 		RemoteKey    string       `json:"remote_key"`
-		Approved     bool         `json:"approved"`
-		Reason       string       `json:"reason,omitempty"`
-		Peers        []string     `json:"peers,omitempty"`
+		WdroneSpotID string       `json:"wdrone_spot_id"`
 		InitPayload  *InitPayload `json:"init_payload,omitempty"`
-		InitPayload2 *InitPayload `json:"init,omitempty"`
 	}
 	var x raw
 	if err := jsonUnmarshal(data, &x); err != nil {
 		return err
 	}
+	r.Session = x.Session
 	r.RemoteKey = x.RemoteKey
-	r.Approved = x.Approved
-	r.Reason = x.Reason
-	r.Peers = x.Peers
-	if x.InitPayload != nil {
-		r.InitPayload = x.InitPayload
-	} else if x.InitPayload2 != nil {
-		r.InitPayload = x.InitPayload2
-	}
+	r.WdroneSpotID = x.WdroneSpotID
+	r.InitPayload = x.InitPayload
+	r.Approved = x.Session != ""
 	return nil
 }
 
@@ -128,31 +130,39 @@ func (r *SignResponse) SessionID() string {
 	return ""
 }
 
-// Submit posts a SignRequest to the phplatform policy module and returns the
-// decoded response.
+// Submit posts a SignRequest to phplatform's WalletSign policy engine and
+// returns the decoded response.
 //
-// Path: `Crypto/ClawdWallet/<walletID>:signRequest`. Per Decision 7 the call
-// is unauthenticated — the policy module only gates which sessions get opened
-// based on its own DB; the agent cannot forge a valid `Crypto_WalletSign_Verify`
-// row and therefore cannot fake an approval. Sender authentication is enforced
-// downstream by the TSS round failing for an agent that doesn't actually hold
-// the wallet's Share 1.
-func Submit(ctx context.Context, walletID string, txBytes []byte, intent Intent, parsed ParsedEffects) (*SignResponse, error) {
-	if walletID == "" {
-		return nil, errors.New("policy: empty walletID")
+// Path: `Crypto/WalletSign:signByPolicy`. Per Decision 7 the call is
+// unauthenticated for agent-type wallets — the policy module only gates which
+// sessions get opened based on its own DB; the agent cannot forge a valid
+// `Crypto_WalletSign_Verify` row and therefore cannot fake an approval.
+// Sender authentication is enforced downstream by the TSS round failing for
+// an agent that doesn't actually hold the wallet's Share 1.
+//
+// `remoteKey` is the libwallet RemoteKey format `<crws-id>:<crwsv-id>` that
+// the agent stored at keygen completion. `hashHex` is the Solana message
+// bytes to sign (hex-encoded). `parsed` is the JSON of the agent's parsed
+// effects + intent that the policy engine examines.
+func Submit(ctx context.Context, remoteKey string, hashHex string, parsed []byte) (*SignResponse, error) {
+	if remoteKey == "" {
+		return nil, errors.New("policy: empty remoteKey")
 	}
-	if len(txBytes) == 0 {
-		return nil, errors.New("policy: empty tx bytes")
+	if hashHex == "" {
+		return nil, errors.New("policy: empty hash")
 	}
-	path := fmt.Sprintf("Crypto/ClawdWallet/%s:signRequest", walletID)
+	if len(parsed) == 0 {
+		return nil, errors.New("policy: empty parsed effects")
+	}
 	req := SignRequest{
-		TxBytes:       base64StdEnc(txBytes),
-		TxType:        "transfer", // Stage 1: only USDC TransferChecked is supported.
-		Intent:        intent,
-		ParsedEffects: parsed,
+		Key:        remoteKey,
+		Hash:       hashHex,
+		ObjectType: "solana_tx",
+		Object:     string(parsed),
+		Curve:      "ed25519",
 	}
 	var resp SignResponse
-	if err := rest.Apply(ctx, path, "POST", req, &resp); err != nil {
+	if err := rest.Apply(ctx, "Crypto/WalletSign:signByPolicy", "POST", req, &resp); err != nil {
 		return nil, fmt.Errorf("policy submit: %w", err)
 	}
 	return &resp, nil

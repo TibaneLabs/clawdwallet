@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -69,10 +70,12 @@ func (p *X402Payer) Pay(ctx context.Context, mint, recipient string, amount uint
 	if err != nil {
 		return nil, err
 	}
-	rawUnsigned, err := serializeUnsigned(tx)
+
+	msgBytes, err := solana.MessageBytes(tx)
 	if err != nil {
 		return nil, err
 	}
+	hashHex := hex.EncodeToString(msgBytes)
 
 	parsed := policy.ParsedEffects{
 		TokenDeltas: []policy.TokenDelta{{
@@ -86,7 +89,17 @@ func (p *X402Payer) Pay(ctx context.Context, mint, recipient string, amount uint
 		Reason:      "required by remote endpoint",
 	}
 
-	resp, err := policy.Submit(ctx, sh.WalletID, rawUnsigned, intent, parsed)
+	x402Ctx := &policy.X402Context{Endpoint: ""}
+	if req != nil {
+		x402Ctx.Endpoint = recipient
+	}
+
+	parsedJSON, err := encodeParsedEffects(intent, parsed, x402Ctx)
+	if err != nil {
+		return nil, fmt.Errorf("encode parsed_effects: %w", err)
+	}
+
+	resp, err := policy.Submit(ctx, sh.WalletID, hashHex, parsedJSON)
 	if err != nil {
 		return nil, fmt.Errorf("policy submit: %w", err)
 	}
@@ -103,10 +116,6 @@ func (p *X402Payer) Pay(ctx context.Context, mint, recipient string, amount uint
 		return nil, err
 	}
 
-	msgBytes, err := solana.MessageBytes(tx)
-	if err != nil {
-		return nil, err
-	}
 	sig, err := a.SignDigest(ctx, sid, msgBytes, signers)
 	if err != nil {
 		return nil, err
@@ -114,6 +123,5 @@ func (p *X402Payer) Pay(ctx context.Context, mint, recipient string, amount uint
 	if err := solana.AttachSignature(tx, myKey, sig); err != nil {
 		return nil, err
 	}
-	_ = req // x402 payment requirement is currently informational; the policy module reads it via SignRequest.X402Context (Stage 2).
 	return tx.MarshalBinary()
 }
