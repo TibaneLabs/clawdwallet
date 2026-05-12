@@ -190,7 +190,7 @@ func TestPairingConcurrentConsumeFirstWins(t *testing.T) {
 
 func TestPairingURL(t *testing.T) {
 	got := PairingURL("k.agent-id", "tok-abc")
-	want := "clawd://pair?agent=k.agent-id&token=tok-abc"
+	want := "tibane://pair?agent=k.agent-id&token=tok-abc"
 	if got != want {
 		t.Fatalf("PairingURL = %q, want %q", got, want)
 	}

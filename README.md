@@ -63,7 +63,7 @@ clawdwallet pair
 ```
 
 This prints a single-use URL of the form
-`clawd://pair?agent=<your-spot-id>&token=<one-shot>`. Give the URL to your
+`tibane://pair?agent=<your-spot-id>&token=<one-shot>`. Give the URL to your
 human (printed in the terminal, or via whatever channel you have with
 them — chat, copy-paste, a QR they scan). The token is valid for 5 minutes
 and dies on first use; if they miss the window, run `pair` again.
@@ -126,7 +126,7 @@ an error — your share alone cannot move funds.
 clawdwallet init       Initialise agent identity + write a default config
 clawdwallet status     Show identity, address, lock state, balance
 clawdwallet daemon     Run the agent in the foreground (accepts Spot msgs)
-clawdwallet pair       Print a one-shot clawd:// URL to pair with the mobile
+clawdwallet pair       Print a one-shot tibane:// URL to pair with the mobile
 clawdwallet keygen     Block until a server-issued walletsign keygen completes
 clawdwallet reshare    Run a reshare ceremony (preserves the wallet address)
 clawdwallet balance    SOL balance (and optionally an SPL balance)

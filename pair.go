@@ -14,7 +14,7 @@ import (
 func init() {
 	register(&command{
 		name:  "pair",
-		short: "Print a one-shot clawd:// URL to pair this agent with the mobile app",
+		short: "Print a one-shot tibane:// URL to pair this agent with the mobile app",
 		run:   runPair,
 	})
 }

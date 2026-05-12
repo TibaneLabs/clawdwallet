@@ -226,9 +226,9 @@ func (a *Agent) SolanaAddress() string {
 // handlers returns the static Spot handler set registered at client construction.
 //
 // `walletsign` is the canonical TSS-over-Spot endpoint shared with wdrone and
-// libwallet (see CLAWDWALLET_STAGE1.md §"Cross-component contracts").
-// `agent`, `policy`, `owner` remain Stage-2 placeholders kept registered so a
-// stale peer gets a useful error rather than dropped traffic.
+// libwallet. `pair` serves the mobile-pairing handshake (see README
+// "Quickstart §3"). `agent`, `policy`, and `owner` are placeholders kept
+// registered so a stale peer gets a useful error rather than dropped traffic.
 func (a *Agent) handlers() map[string]spotlib.MessageHandler {
 	return map[string]spotlib.MessageHandler{
 		"walletsign": a.handleWalletSign,

@@ -13,7 +13,7 @@ import (
 )
 
 // Pairing handshake — see tibaneapp/docs/clawdwallet-pairing.md for the
-// wire-level contract. The agent emits a `clawd://pair?agent=...&token=...`
+// wire-level contract. The agent emits a `tibane://pair?agent=...&token=...`
 // URL via the `pair` CLI subcommand; the mobile app posts a pair-request to
 // the agent's `pair` Spot endpoint and gets back the agent's identity (or one
 // of the four contract error codes).
@@ -222,11 +222,11 @@ func pairErrorBody(code PairingError, msg string) []byte {
 	return body
 }
 
-// PairingURL builds the `clawd://pair?agent=...&token=...` URL for the given
+// PairingURL builds the `tibane://pair?agent=...&token=...` URL for the given
 // agent Spot id and token. Both values are inserted verbatim — Spot ids and
 // base64url tokens are already URL-safe.
 func PairingURL(agentSpotID, token string) string {
-	return "clawd://pair?agent=" + agentSpotID + "&token=" + token
+	return "tibane://pair?agent=" + agentSpotID + "&token=" + token
 }
 
 // agentVersion returns a short version string for the running binary, taken

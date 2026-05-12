@@ -27,7 +27,7 @@ const (
 
 // InitPayload is the bare body of a `<peer>/walletsign/<sid>/init` message.
 //
-// Wire shape (per CLAWDWALLET_STAGE1.md "Integration phase decisions"):
+// Wire shape:
 //
 //	{
 //	  "sid":  "<crwsv-...>",
