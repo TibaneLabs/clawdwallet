@@ -2,19 +2,22 @@ package agent
 
 import (
 	"context"
-	"crypto/sha512"
 	"encoding/base64"
 	"errors"
 	"fmt"
 
 	"github.com/KarpelesLab/outscript"
-	"github.com/google/uuid"
 
 	"github.com/TibaneLabs/clawdwallet/policy"
 	"github.com/TibaneLabs/clawdwallet/solana"
+	"github.com/TibaneLabs/clawdwallet/store"
 )
 
-// TransferOptions is the input to BuildTransfer.
+// base64URLEncode is a local alias used when assembling InitPayload-style
+// peer key fields (raw bytes → base64url).
+func base64URLEncode(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+// TransferOptions is the input to BuildAndPay.
 type TransferOptions struct {
 	// To is the destination Solana address (base58).
 	To string
@@ -26,13 +29,18 @@ type TransferOptions struct {
 	Decimals uint8
 	// Intent describes why the agent is making this transfer.
 	Intent policy.Intent
-	// X402 optionally tags the transfer as an x402 payment.
+	// X402 optionally tags the transfer as an x402 payment (Stage 2).
 	X402 *policy.X402Context
 }
 
-// BuildAndPay constructs the transaction, requests policy approval, runs the
-// TSS signing round, and submits the result to Solana. Returns the on-chain
-// signature.
+// BuildAndPay constructs the transaction, calls the phplatform policy module's
+// `:signRequest` REST endpoint, joins the resulting TSS sign ceremony, and
+// submits the signed transaction to Solana. Returns the on-chain signature.
+//
+// Per Stage 1: the agent self-reports parsed_effects (Decision 8). On approval
+// the policy module opens a `Crypto_WalletSign_Verify` row of type `sign` with
+// the digest as Data; wdrone polls for it and joins. The agent kicks the
+// ceremony off by sending `<wdrone>/walletsign/<sid>/init`.
 func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, error) {
 	if a.Locked() {
 		return "", errors.New("wallet is locked")
@@ -40,6 +48,9 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 	sh := a.Share()
 	if sh == nil {
 		return "", errors.New("no share on disk; run keygen first")
+	}
+	if sh.WalletID == "" {
+		return "", errors.New("share has no wallet id; cannot call :signRequest")
 	}
 	addr, err := solana.AddressFromPubKey(sh.SolanaAddressBytes())
 	if err != nil {
@@ -53,7 +64,6 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 	}
 
 	var ix outscript.SolanaInstruction
-	var txType string
 	var parsed policy.ParsedEffects
 
 	switch {
@@ -63,7 +73,6 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 			return "", fmt.Errorf("parse dest: %w", err)
 		}
 		ix = outscript.SolanaTransferInstruction(myKey, toKey, opts.Amount)
-		txType = "transfer"
 		parsed = policy.ParsedEffects{
 			SOLDelta:        -int64(opts.Amount),
 			ProgramsInvoked: []string{outscript.SolanaSystemProgram.String()},
@@ -86,11 +95,6 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 			return "", fmt.Errorf("derive dest ATA: %w", err)
 		}
 		ix = solana.SPLTransferCheckedInstruction(sourceATA, mintKey, destATA, myKey, opts.Amount, opts.Decimals)
-		ttype := "transfer"
-		if opts.X402 != nil {
-			ttype = "x402_payment"
-		}
-		txType = ttype
 		parsed = policy.ParsedEffects{
 			TokenDeltas: []policy.TokenDelta{{
 				Mint: opts.Mint, Delta: -int64(opts.Amount), Decimals: opts.Decimals,
@@ -108,47 +112,36 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 		return "", err
 	}
 
-	req := &policy.SignRequest{
-		RequestID:     uuid.NewString(),
-		TxBytes:       base64.StdEncoding.EncodeToString(rawTx),
-		TxType:        txType,
-		Intent:        opts.Intent,
-		ParsedEffects: parsed,
-		X402Context:   opts.X402,
-	}
-	pc := policy.New(a.client, a.cfg.PolicyID)
-	resp, err := pc.Submit(ctx, req)
+	resp, err := policy.Submit(ctx, sh.WalletID, rawTx, opts.Intent, parsed)
 	if err != nil {
 		return "", fmt.Errorf("policy submit: %w", err)
 	}
 	if !resp.Approved {
-		if resp.EscalatedToOwner {
-			return "", fmt.Errorf("policy escalated to owner; reason: %s", resp.Reason)
-		}
-		if resp.Question != "" {
-			return "", fmt.Errorf("policy requested clarification: %s", resp.Question)
-		}
 		return "", fmt.Errorf("policy denied: %s", resp.Reason)
+	}
+	sid := resp.SessionID()
+	if sid == "" {
+		return "", fmt.Errorf("policy approval missing session id (remote_key=%q)", resp.RemoteKey)
+	}
+
+	// Prefer the policy module's InitPayload.peers (carries canonical Key
+	// bytes per peer) over the bare spot-id list. Falls back to share-derived
+	// peers when neither shape is present.
+	signers, err := a.resolveSigners(resp, sh)
+	if err != nil {
+		return "", err
 	}
 
 	// Compute the digest the TSS round will sign over. For Solana that's the
-	// raw message bytes (NOT a sha-hashed pre-image). tss-lib's EdDSA signing
-	// takes the message as a big.Int and treats it directly, so we pass the
-	// message bytes through unchanged.
+	// raw message bytes (NOT a pre-hashed pre-image): tss-lib's EdDSA signing
+	// takes the message as a big.Int and treats it directly so the resulting
+	// signature verifies under stdlib ed25519.Verify.
 	msgBytes, err := solana.MessageBytes(tx)
 	if err != nil {
 		return "", err
 	}
 
-	// Most TSS-EdDSA implementations sign over a hash-then-clamp transcript; the
-	// outscript Sign path uses ed25519.Sign which performs the standard
-	// pre-hash internally. The eddsa signing.LocalParty in tss-lib v2 expects
-	// the *message* (not hash), but to keep wire compatibility with stdlib
-	// Ed25519 verification we sign over the message exactly as ed25519.Sign
-	// would see it.
-	_ = sha512.New // documents the relationship; not used directly
-
-	sig, err := a.SignDigest(ctx, msgBytes, nil)
+	sig, err := a.SignDigest(ctx, sid, msgBytes, signers)
 	if err != nil {
 		return "", fmt.Errorf("tss sign: %w", err)
 	}
@@ -160,6 +153,89 @@ func (a *Agent) BuildAndPay(ctx context.Context, opts TransferOptions) (string, 
 		return "", fmt.Errorf("marshal signed tx: %w", err)
 	}
 	return a.rpc.SendTransaction(ctx, wire)
+}
+
+// resolveSigners turns the policy response into PeerSpecs ready for the TSS
+// round. Source-of-truth priority:
+//
+//  1. resp.InitPayload.Peers — canonical, carries SpotID + moniker + key.
+//  2. resp.Peers (bare spot-id list) — agent fills moniker + falls back to
+//     share-derived keys for the bigint slot.
+//  3. share-recorded peers — last resort, only if the policy module returned
+//     nothing useful.
+//
+// In all cases the agent ensures its own SpotID is included once. The result
+// is trimmed to Threshold+1 only when the policy module supplied no explicit
+// shape (case 3); when the policy module told us the peer set we trust it.
+func (a *Agent) resolveSigners(resp *policy.SignResponse, sh *store.Share) ([]PeerSpec, error) {
+	mySpot := a.SpotID()
+
+	if resp != nil && resp.InitPayload != nil && len(resp.InitPayload.Peers) > 0 {
+		out := make([]PeerSpec, 0, len(resp.InitPayload.Peers))
+		for _, p := range resp.InitPayload.Peers {
+			moniker := p.Moniker
+			if moniker == "" && p.SpotID == mySpot {
+				moniker = a.cfg.Moniker
+			} else if moniker == "" {
+				moniker = "peer"
+			}
+			out = append(out, PeerSpec{SpotID: p.SpotID, Moniker: moniker, Key: p.Key})
+		}
+		return out, nil
+	}
+
+	if resp != nil && len(resp.Peers) > 0 {
+		out := make([]PeerSpec, 0, len(resp.Peers))
+		for _, id := range resp.Peers {
+			moniker := "peer"
+			if id == mySpot {
+				moniker = a.cfg.Moniker
+			}
+			ps := PeerSpec{SpotID: id, Moniker: moniker}
+			// Best effort: lift the canonical key bytes from our share's
+			// recorded peer keys so the bigint slot matches wdrone's. The
+			// shared PartyID.Key fallback (sha256) would otherwise diverge
+			// from wdrone's raw-pubkey derivation.
+			ps.Key = a.shareKeyFor(sh, id)
+			out = append(out, ps)
+		}
+		return out, nil
+	}
+
+	if len(sh.PeerSpotIDs) == 0 {
+		return nil, errors.New("no signer peers known")
+	}
+	out := make([]PeerSpec, 0, sh.Threshold+1)
+	out = append(out, PeerSpec{SpotID: mySpot, Moniker: a.cfg.Moniker, Key: a.shareKeyFor(sh, mySpot)})
+	for _, id := range sh.PeerSpotIDs {
+		if id == mySpot {
+			continue
+		}
+		out = append(out, PeerSpec{SpotID: id, Moniker: "peer", Key: a.shareKeyFor(sh, id)})
+		if len(out) >= sh.Threshold+1 {
+			break
+		}
+	}
+	return out, nil
+}
+
+// shareKeyFor returns the base64url-encoded canonical key bytes for spotID,
+// looked up in the persisted share's peer table. Returns "" when the share
+// doesn't carry per-peer key bytes (older keygen runs).
+func (a *Agent) shareKeyFor(sh *store.Share, spotID string) string {
+	if sh == nil {
+		return ""
+	}
+	for i, id := range sh.PeerSpotIDs {
+		if id != spotID {
+			continue
+		}
+		if i >= len(sh.PeerKeys) || sh.PeerKeys[i] == nil {
+			return ""
+		}
+		return base64URLEncode(sh.PeerKeys[i].Bytes())
+	}
+	return ""
 }
 
 // serializeUnsigned returns the wire form of a tx with empty signature slots.

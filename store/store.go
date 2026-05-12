@@ -17,7 +17,7 @@ import (
 
 	"github.com/BottleFmt/gobottle"
 	tsslibcrypto "github.com/KarpelesLab/tss-lib/v2/crypto"
-	"github.com/KarpelesLab/tss-lib/v2/eddsa/keygen"
+	"github.com/KarpelesLab/tss-lib/v2/eddsatss"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -26,11 +26,12 @@ const shareFile = "share.bottle"
 // Share holds the persisted EdDSA TSS keygen output for this party plus the metadata
 // needed to reconstruct signing parameters across restarts.
 type Share struct {
-	// WalletID identifies the wallet this share belongs to.
+	// WalletID identifies the wallet this share belongs to. In Stage 1 this
+	// is the server-issued crws- id (or the session id during initial keygen).
 	WalletID string `json:"wallet_id"`
 
 	// PartyKey is the deterministic big.Int key used to construct this party's PartyID.
-	PartyKey *big.Int `json:"party_key"`
+	PartyKey *big.Int `json:"party_key,omitempty"`
 
 	// PeerKeys is the deterministic ordered list of party keys (including us).
 	// The index of PartyKey within PeerKeys is this party's slot.
@@ -42,9 +43,10 @@ type Share struct {
 	// Threshold is t in t-of-n. For 2-of-3, this is 1 (signing requires t+1=2).
 	Threshold int `json:"threshold"`
 
-	// SaveData is the raw EdDSA keygen output. Encoded as JSON so we don't have
-	// to write a CBOR mapping for tss-lib's BigInt-laden struct.
-	SaveData *keygen.LocalPartySaveData `json:"save_data"`
+	// EDKey is the raw eddsatss keygen output. Encoded as JSON. The eddsatss.Key
+	// type is JSON-compatible with the older eddsa/keygen.LocalPartySaveData
+	// shape, so on-disk shares written by either API decode to the same struct.
+	EDKey *eddsatss.Key `json:"save_data"`
 
 	// PubKey is the aggregate EdDSA public key (32 bytes Ed25519 encoding).
 	// On Solana this is the wallet address.
@@ -59,10 +61,10 @@ func (s *Share) SolanaAddressBytes() []byte {
 		copy(out, s.PubKey)
 		return out
 	}
-	if s.SaveData == nil || s.SaveData.EDDSAPub == nil {
+	if s.EDKey == nil || s.EDKey.EDDSAPub == nil {
 		return nil
 	}
-	return EdPointBytes(s.SaveData.EDDSAPub)
+	return EdPointBytes(s.EDKey.EDDSAPub)
 }
 
 // EdPointBytes serializes an Ed25519 point to its 32-byte compressed form

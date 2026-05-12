@@ -17,9 +17,15 @@ import (
 )
 
 func init() {
+	if os.Getenv("CLAWDWALLET_ENABLE_X402") == "" {
+		// Stage 2: x402 client polish is deferred. The handler types still
+		// build (agent/x402.go) so phplatform/wdrone integrations can be
+		// developed against the stubs.
+		return
+	}
 	register(&command{
 		name:  "x402",
-		short: "Perform an HTTP request that may require x402 payment",
+		short: "(Stage 2) HTTP request that may require x402 payment",
 		run:   runX402,
 	})
 }

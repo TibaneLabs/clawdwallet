@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
+	"errors"
 	"fmt"
 
 	"github.com/KarpelesLab/outscript"
@@ -12,19 +12,26 @@ import (
 	"github.com/TibaneLabs/clawdwallet/x402"
 )
 
-// X402Payer adapts the agent to x402.Payer, producing a signed TransferChecked
-// transaction without broadcasting (the x402 facilitator will broadcast).
+// X402Payer adapts the agent to x402.Payer.
+//
+// Stage 2: the x402 client surface is flag-gated. Pay is wired up against the
+// same policy REST + walletsign TSS plumbing as BuildAndPay so the path stays
+// compilable, but the CLI/MCP commands that hand out an X402Payer are gated
+// behind CLAWDWALLET_ENABLE_X402.
 type X402Payer struct{ A *Agent }
 
 // Pay implements x402.Payer.
 func (p *X402Payer) Pay(ctx context.Context, mint, recipient string, amount uint64, req *x402.PaymentRequirement) ([]byte, error) {
 	a := p.A
 	if a.Locked() {
-		return nil, fmt.Errorf("wallet locked")
+		return nil, errors.New("wallet locked")
 	}
 	sh := a.Share()
 	if sh == nil {
-		return nil, fmt.Errorf("no share available")
+		return nil, errors.New("no share available")
+	}
+	if sh.WalletID == "" {
+		return nil, errors.New("share has no wallet id")
 	}
 	addr, err := solana.AddressFromPubKey(sh.SolanaAddressBytes())
 	if err != nil {
@@ -67,44 +74,46 @@ func (p *X402Payer) Pay(ctx context.Context, mint, recipient string, amount uint
 		return nil, err
 	}
 
-	pr := &policy.SignRequest{
-		RequestID: "x402-" + base64.RawURLEncoding.EncodeToString([]byte(req.Receiver))[:12],
-		TxBytes:   base64.StdEncoding.EncodeToString(rawUnsigned),
-		TxType:    "x402_payment",
-		Intent: policy.Intent{
-			Description: "x402 payment",
-			Skill:       "x402",
-			Reason:      "required by remote endpoint",
-		},
-		ParsedEffects: policy.ParsedEffects{
-			TokenDeltas: []policy.TokenDelta{{
-				Mint: mint, Delta: -int64(amount), Decimals: decimals,
-			}},
-			ProgramsInvoked: []string{solana.SolanaTokenProgram.String()},
-		},
-		X402Context: &policy.X402Context{
-			Endpoint: req.Receiver,
-		},
+	parsed := policy.ParsedEffects{
+		TokenDeltas: []policy.TokenDelta{{
+			Mint: mint, Delta: -int64(amount), Decimals: decimals,
+		}},
+		ProgramsInvoked: []string{solana.SolanaTokenProgram.String()},
 	}
-	pcli := policy.New(a.client, a.cfg.PolicyID)
-	resp, err := pcli.Submit(ctx, pr)
+	intent := policy.Intent{
+		Description: "x402 payment",
+		Skill:       "x402",
+		Reason:      "required by remote endpoint",
+	}
+
+	resp, err := policy.Submit(ctx, sh.WalletID, rawUnsigned, intent, parsed)
 	if err != nil {
 		return nil, fmt.Errorf("policy submit: %w", err)
 	}
 	if !resp.Approved {
 		return nil, fmt.Errorf("policy denied: %s", resp.Reason)
 	}
+	sid := resp.SessionID()
+	if sid == "" {
+		return nil, fmt.Errorf("policy approval missing session id (remote_key=%q)", resp.RemoteKey)
+	}
+
+	signers, err := a.resolveSigners(resp, sh)
+	if err != nil {
+		return nil, err
+	}
 
 	msgBytes, err := solana.MessageBytes(tx)
 	if err != nil {
 		return nil, err
 	}
-	sig, err := a.SignDigest(ctx, msgBytes, nil)
+	sig, err := a.SignDigest(ctx, sid, msgBytes, signers)
 	if err != nil {
 		return nil, err
 	}
 	if err := solana.AttachSignature(tx, myKey, sig); err != nil {
 		return nil, err
 	}
+	_ = req // x402 payment requirement is currently informational; the policy module reads it via SignRequest.X402Context (Stage 2).
 	return tx.MarshalBinary()
 }

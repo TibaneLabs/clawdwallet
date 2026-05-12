@@ -2,89 +2,151 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
-	"time"
 
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
 
-// SessionKind describes which TSS ceremony a session is running.
+// SessionKind names the TSS ceremony a session is running.
+//
+// String values follow the canonical wdrone/phplatform vocabulary so that
+// JSON-serialised InitPayloads round-trip across the three TSS parties:
+// `txsign` (NOT `sign`) is the Stage-1 EdDSA signing ceremony, distinct from
+// the legacy wdrone `sign` SMS flow.
 type SessionKind string
 
 const (
 	SessionKeygen  SessionKind = "keygen"
-	SessionSign    SessionKind = "sign"
+	SessionSign    SessionKind = "txsign"
 	SessionReshare SessionKind = "reshare"
 )
 
-// WalletAction names the sub-protocol multiplexed onto the single "wallet"
-// Spot endpoint. (spotlib only routes by the first path segment, so we
-// re-introduce structure inside the payload.)
-type WalletAction string
-
-const (
-	WalletInit      WalletAction = "init"
-	WalletBroadcast WalletAction = "broadcast"
-)
-
-// WalletEnvelope is the outer JSON sent on every "wallet" message.
-type WalletEnvelope struct {
-	Action     WalletAction    `json:"action"`
-	SessionID  string          `json:"sid"`
-	FromSpotID string          `json:"from"`
-	Payload    json.RawMessage `json:"payload"`
-}
-
-// InitPayload describes a ceremony to join.
+// InitPayload is the bare body of a `<peer>/walletsign/<sid>/init` message.
+//
+// Wire shape (per CLAWDWALLET_STAGE1.md "Integration phase decisions"):
+//
+//	{
+//	  "sid":  "<crwsv-...>",
+//	  "type": "keygen" | "txsign",
+//	  "curve": "ed25519",
+//	  "threshold": 1,
+//	  "peers": [
+//	    {"spot_id": "k.<base64>", "moniker": "...",
+//	     "key": "<base64url Ed25519 pubkey>"}
+//	  ],
+//	  "digest": "<base64 32 bytes, txsign only>"
+//	}
+//
+// The legacy `kind` and `wallet_id` aliases are tolerated for backward
+// compatibility with the original Stage-1 scaffolding. UnmarshalJSON coerces
+// `kind`/`type` into Kind and applies sensible defaults (curve=ed25519,
+// threshold=1) when the policy module omits them.
 type InitPayload struct {
-	Kind         SessionKind `json:"kind"`
-	Peers        []PeerSpec  `json:"peers"`
-	Threshold    int         `json:"threshold,omitempty"`
-	Message      string      `json:"message,omitempty"` // base64 digest, sign only
-	NewPeers     []PeerSpec  `json:"new_peers,omitempty"`
-	NewThreshold int         `json:"new_threshold,omitempty"`
+	// Kind is the canonical session type ("keygen", "txsign", "reshare").
+	// Encoded as `type` on the wire; `kind` is accepted on input.
+	Kind SessionKind `json:"type,omitempty"`
+
+	// SID is the server-issued session id; carried for self-contained
+	// payloads (the recipient also has it in the URL path).
+	SID string `json:"sid,omitempty"`
+
+	// Curve is "ed25519" for Stage 1.
+	Curve string `json:"curve,omitempty"`
+
+	// Peers is the full participant set (sorted by KeyInt before
+	// constructing tss PartyIDs).
+	Peers []PeerSpec `json:"peers"`
+
+	// Threshold is t in t-of-n (signing needs t+1 peers).
+	Threshold int `json:"threshold,omitempty"`
+
+	// Digest is base64 of the 32-byte digest to sign over (txsign only).
+	// Wdrone tolerates hex and base64; we always emit base64 on the wire.
+	Digest string `json:"digest,omitempty"`
+
+	// WalletID is the crws- identifier on the server side. Carried for
+	// traceability; the agent only needs the sid for routing.
+	WalletID string `json:"wallet_id,omitempty"`
+
+	// Reshare-only fields, kept for forward-compat with the gated reshare path.
+	NewPeers     []PeerSpec `json:"new_peers,omitempty"`
+	NewThreshold int        `json:"new_threshold,omitempty"`
 }
 
-// BroadcastPayload carries one tss-lib wire frame.
-type BroadcastPayload struct {
-	IsBroadcast bool   `json:"bcast"`
-	Bytes       string `json:"bytes"` // base64 wire bytes
+// UnmarshalJSON accepts the canonical `type` field as well as the original
+// `kind` alias used by the Stage-1 scaffolding. It also defaults Curve to
+// "ed25519" when absent, matching the policy module's omit-empty behaviour.
+func (ip *InitPayload) UnmarshalJSON(data []byte) error {
+	type raw struct {
+		Kind         SessionKind `json:"kind,omitempty"`
+		Type         SessionKind `json:"type,omitempty"`
+		SID          string      `json:"sid,omitempty"`
+		Curve        string      `json:"curve,omitempty"`
+		Peers        []PeerSpec  `json:"peers"`
+		Threshold    int         `json:"threshold,omitempty"`
+		Digest       string      `json:"digest,omitempty"`
+		Message      string      `json:"message,omitempty"`
+		WalletID     string      `json:"wallet_id,omitempty"`
+		NewPeers     []PeerSpec  `json:"new_peers,omitempty"`
+		NewThreshold int         `json:"new_threshold,omitempty"`
+	}
+	var r raw
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	ip.Kind = r.Type
+	if ip.Kind == "" {
+		ip.Kind = r.Kind
+	}
+	// Tolerate the older "sign" value as an alias for "txsign".
+	if ip.Kind == "sign" {
+		ip.Kind = SessionSign
+	}
+	ip.SID = r.SID
+	ip.Curve = r.Curve
+	if ip.Curve == "" {
+		ip.Curve = "ed25519"
+	}
+	ip.Peers = r.Peers
+	ip.Threshold = r.Threshold
+	ip.Digest = r.Digest
+	if ip.Digest == "" {
+		// Some integrators (notably the policy module's stage 1 stub) use
+		// `message` for the 32-byte sign target. Accept both — they are
+		// the same field semantically.
+		ip.Digest = r.Message
+	}
+	ip.WalletID = r.WalletID
+	ip.NewPeers = r.NewPeers
+	ip.NewThreshold = r.NewThreshold
+	return nil
 }
 
-// Session is one in-flight TSS ceremony with a single tss.Party driver.
+// Session is one in-flight TSS ceremony driven through a JsonMessage broker.
+//
+// The broker is shared by the local party and the outbound wireSend closure:
+// the protocol calls broker.Receive on outbound messages (which the broker
+// recognises as `fromSelf` and routes via send), and the agent's inbound spot
+// handler calls broker.dispatchInbound to feed remote frames into the same
+// broker for local dispatch.
 type Session struct {
 	ID    string
 	Kind  SessionKind
 	Peers []PeerSpec
+	Self  *tss.PartyID
 
-	party    tss.Party
-	doneCh   chan struct{}
-	err      error
-	once     sync.Once
-	out      chan tss.Message
-	peerByID map[string]*tss.PartyID
+	broker *spotBroker
+
+	doneCh chan struct{}
+	err    error
+	once   sync.Once
 
 	// Result is populated when the ceremony completes.
 	Result any
-}
-
-func newSession(id string, kind SessionKind, peers []PeerSpec, out chan tss.Message) *Session {
-	idx := make(map[string]*tss.PartyID, len(peers))
-	for _, p := range peers {
-		idx[p.SpotID] = PartyIDFromPeer(p)
-	}
-	return &Session{
-		ID:       id,
-		Kind:     kind,
-		Peers:    peers,
-		doneCh:   make(chan struct{}),
-		out:      out,
-		peerByID: idx,
-	}
 }
 
 func (s *Session) finish(err error) {
@@ -132,93 +194,73 @@ func (r *SessionRegistry) Drop(sid string) {
 	delete(r.m, sid)
 }
 
-// pumpOutbound reads per-round TSS messages from the session's out channel and
-// publishes them as WalletEnvelope/BroadcastPayload frames over Spot.
-func (a *Agent) pumpOutbound(s *Session) {
-	for {
-		select {
-		case <-s.doneCh:
-			return
-		case msg, ok := <-s.out:
-			if !ok {
-				return
-			}
-			if err := a.sendTSSMessage(s, msg); err != nil {
-				s.finish(fmt.Errorf("outbound TSS: %w", err))
-				return
-			}
+// spotBroker implements tss.MessageBroker for a single Session, mirroring the
+// wdrone/libwallet broker design: the protocol calls Receive in both directions
+// and we distinguish outbound vs inbound by checking msg.From against the
+// session's own KeyInt. Outbound goes to wireSend; inbound is dispatched to the
+// registered MessageReceiver (or queued under pending if Connect hasn't fired
+// yet for that type).
+type spotBroker struct {
+	selfKey  *tss.PartyID
+	send     func(ctx context.Context, msg *tss.JsonMessage)
+	mu       sync.Mutex
+	handlers map[string]tss.MessageReceiver
+	pending  map[string][]*tss.JsonMessage
+}
+
+func newSpotBroker(self *tss.PartyID, send func(context.Context, *tss.JsonMessage)) *spotBroker {
+	return &spotBroker{
+		selfKey:  self,
+		send:     send,
+		handlers: make(map[string]tss.MessageReceiver),
+		pending:  make(map[string][]*tss.JsonMessage),
+	}
+}
+
+func (b *spotBroker) Connect(typ string, dest tss.MessageReceiver) {
+	b.mu.Lock()
+	b.handlers[typ] = dest
+	queued := b.pending[typ]
+	delete(b.pending, typ)
+	b.mu.Unlock()
+	for _, msg := range queued {
+		if err := dest.Receive(msg); err != nil {
+			log.Printf("spotBroker: queued delivery of %s failed: %s", typ, err)
 		}
 	}
 }
 
-func (a *Agent) sendTSSMessage(s *Session, msg tss.Message) error {
-	bz, routing, err := msg.WireBytes()
-	if err != nil {
-		return err
-	}
-	bp := BroadcastPayload{
-		IsBroadcast: routing.IsBroadcast,
-		Bytes:       base64.StdEncoding.EncodeToString(bz),
-	}
-	payloadJSON, err := json.Marshal(bp)
-	if err != nil {
-		return err
-	}
-	env := WalletEnvelope{
-		Action:     WalletBroadcast,
-		SessionID:  s.ID,
-		FromSpotID: a.SpotID(),
-		Payload:    payloadJSON,
-	}
-	body, err := json.Marshal(env)
-	if err != nil {
-		return err
-	}
-
-	if !routing.IsBroadcast && len(routing.To) > 0 {
-		for _, to := range routing.To {
-			if to.Id == a.SpotID() {
-				continue
-			}
-			if err := a.sendToWallet(to.Id, body); err != nil {
-				return err
-			}
-		}
+func (b *spotBroker) Receive(msg *tss.JsonMessage) error {
+	toSelf := msg.To != nil && msg.To.KeyInt().Cmp(b.selfKey.KeyInt()) == 0
+	fromSelf := msg.From != nil && msg.From.KeyInt().Cmp(b.selfKey.KeyInt()) == 0
+	if fromSelf && !toSelf {
+		b.send(context.Background(), msg)
 		return nil
 	}
-	for _, p := range s.Peers {
-		if p.SpotID == a.SpotID() {
-			continue
-		}
-		if err := a.sendToWallet(p.SpotID, body); err != nil {
-			return err
-		}
-	}
-	return nil
+	return b.dispatch(msg)
 }
 
-// dispatchWire feeds an inbound BroadcastPayload into the session's tss.Party.
-func (s *Session) dispatchWire(fromSpotID string, bp *BroadcastPayload) error {
-	if s.party == nil {
-		return errors.New("session has no party")
+func (b *spotBroker) dispatch(msg *tss.JsonMessage) error {
+	b.mu.Lock()
+	h, ok := b.handlers[msg.Type]
+	if !ok {
+		b.pending[msg.Type] = append(b.pending[msg.Type], msg)
+		b.mu.Unlock()
+		return nil
 	}
-	bz, err := base64.StdEncoding.DecodeString(bp.Bytes)
-	if err != nil {
-		return fmt.Errorf("decode wire bytes: %w", err)
-	}
-	from := s.peerByID[fromSpotID]
-	if from == nil {
-		return fmt.Errorf("unknown sender %s", fromSpotID)
-	}
-	if _, err := s.party.UpdateFromBytes(bz, from, bp.IsBroadcast); err != nil {
-		return fmt.Errorf("party update: %w", err)
-	}
-	return nil
+	b.mu.Unlock()
+	return h.Receive(msg)
 }
 
-// sendToWallet pushes an envelope to <target>/wallet.
-func (a *Agent) sendToWallet(target string, body []byte) error {
-	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
-	defer cancel()
-	return a.client.SendToWithFrom(ctx, target+"/wallet", body, "wallet")
+// dispatchInbound parses a raw JSON tss.JsonMessage payload received over Spot
+// and feeds it through Receive for local handler dispatch.
+func (b *spotBroker) dispatchInbound(data []byte) error {
+	var jm tss.JsonMessage
+	if err := json.Unmarshal(data, &jm); err != nil {
+		return fmt.Errorf("parse JsonMessage: %w", err)
+	}
+	if jm.From == nil {
+		return errors.New("incoming JsonMessage has no From")
+	}
+	return b.Receive(&jm)
 }

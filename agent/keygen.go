@@ -8,91 +8,18 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/KarpelesLab/tss-lib/v2/eddsa/keygen"
+	"github.com/KarpelesLab/tss-lib/v2/eddsatss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
-	"github.com/google/uuid"
 
 	"github.com/TibaneLabs/clawdwallet/solana"
 	"github.com/TibaneLabs/clawdwallet/store"
 )
 
-// Keygen runs a 3-party EdDSA keygen ceremony with the given peers (which
-// must include this agent) and persists the resulting share on success.
+// onInit handles an inbound `<my_spot_id>/walletsign/<sid>/init` message.
 //
-// threshold is t in t-of-n; for the canonical 2-of-3 wallet this is 1.
-func (a *Agent) Keygen(ctx context.Context, peers []PeerSpec, threshold int) (*store.Share, error) {
-	if a.client == nil {
-		return nil, errors.New("agent not started")
-	}
-	if !containsSpotID(peers, a.SpotID()) {
-		return nil, errors.New("keygen: this agent is not in the peer set")
-	}
-	sid := "kg-" + uuid.NewString()
-
-	// Tell every remote peer to spin up its party for this session.
-	if err := a.broadcastInit(ctx, sid, peers, &InitPayload{
-		Kind:      SessionKeygen,
-		Peers:     peers,
-		Threshold: threshold,
-	}); err != nil {
-		return nil, fmt.Errorf("broadcast init: %w", err)
-	}
-
-	// Run our own keygen party locally and wait for its end channel.
-	share, err := a.runKeygen(ctx, sid, peers, threshold)
-	if err != nil {
-		return nil, err
-	}
-
-	a.cfg.WalletID = share.WalletID
-	a.cfg.SolanaAddress, _ = solana.AddressFromPubKey(share.SolanaAddressBytes())
-	_ = a.cfg.Save()
-	return share, a.SetShare(share)
-}
-
-// runKeygen instantiates a keygen.LocalParty and pumps its channels until done.
-func (a *Agent) runKeygen(ctx context.Context, sid string, peers []PeerSpec, threshold int) (*store.Share, error) {
-	sortedIDs := SortedPartyIDs(peers)
-	myID := findMyPartyID(sortedIDs, a.SpotID())
-	if myID == nil {
-		return nil, errors.New("keygen: this agent's PartyID could not be located")
-	}
-	peerCtx := tss.NewPeerContext(sortedIDs)
-	params := tss.NewParameters(tss.Edwards(), peerCtx, myID, len(sortedIDs), threshold)
-
-	outCh := make(chan tss.Message, 4*len(sortedIDs))
-	endCh := make(chan *keygen.LocalPartySaveData, 1)
-
-	party := keygen.NewLocalParty(params, outCh, endCh)
-	session := newSession(sid, SessionKeygen, peers, outCh)
-	session.party = party
-	a.registry.Put(session)
-	defer a.registry.Drop(sid)
-
-	go a.pumpOutbound(session)
-
-	go func() {
-		if err := party.Start(); err != nil {
-			session.finish(err)
-		}
-	}()
-
-	select {
-	case data := <-endCh:
-		session.finish(nil)
-		return saveDataToShare(sid, peers, threshold, data), nil
-	case <-session.doneCh:
-		if session.err != nil {
-			return nil, session.err
-		}
-		return nil, errors.New("keygen ended without producing share")
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-// onInit handles an inbound "init" message from a peer. We accept it, spin up
-// a matching party, and pump.
+// Per Stage 1 the agent is JOIN-only: it accepts the server-issued session id,
+// runs the appropriate `eddsatss` ceremony, and persists the result. Stage-2
+// reshare and any other initiator-side flow are deferred.
 func (a *Agent) onInit(sid, from string, ip *InitPayload) ([]byte, error) {
 	switch ip.Kind {
 	case SessionKeygen:
@@ -102,79 +29,155 @@ func (a *Agent) onInit(sid, from string, ip *InitPayload) ([]byte, error) {
 		go a.joinSign(sid, ip)
 		return []byte(`{"accepted":true}`), nil
 	case SessionReshare:
-		go a.joinReshare(sid, ip)
-		return []byte(`{"accepted":true}`), nil
+		// Stage 2: reshare is flag-gated; reject early so the demo path is
+		// deterministic. The reshare driver is still present but unwired.
+		return nil, errors.New("reshare ceremonies are not enabled in Stage 1")
 	default:
 		return nil, fmt.Errorf("unknown session kind %q", ip.Kind)
 	}
 }
 
+// joinKeygen drives an `eddsatss.NewKeygen` party for the server-issued sid.
+//
+// The InitPayload carries the full peer set and threshold; the agent sorts
+// them deterministically and dispatches outbound JsonMessages over Spot using
+// the walletsign recipient convention.
 func (a *Agent) joinKeygen(sid string, ip *InitPayload) {
 	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Minute)
 	defer cancel()
-	share, err := a.runKeygen(ctx, sid, ip.Peers, ip.Threshold)
+
+	if !containsSpotID(ip.Peers, a.SpotID()) {
+		a.log.Error("joinKeygen: this agent is not in the peer set", "sid", sid)
+		return
+	}
+
+	share, err := a.runKeygen(ctx, sid, ip)
 	if err != nil {
 		a.log.Error("joinKeygen", "sid", sid, "err", err)
 		return
 	}
+
 	a.cfg.WalletID = share.WalletID
 	a.cfg.SolanaAddress, _ = solana.AddressFromPubKey(share.SolanaAddressBytes())
-	_ = a.cfg.Save()
+	if err := a.cfg.Save(); err != nil {
+		a.log.Warn("joinKeygen: persist config", "err", err)
+	}
 	if err := a.SetShare(share); err != nil {
-		a.log.Error("persist share", "err", err)
+		a.log.Error("joinKeygen: persist share", "err", err)
+	}
+	a.log.Info("keygen complete", "sid", sid, "address", a.cfg.SolanaAddress)
+}
+
+// runKeygen instantiates an eddsatss.NewKeygen tied to a per-session
+// spotBroker. The broker bridges the protocol's outbound JsonMessages to the
+// walletsign Spot path, and feeds inbound peer frames back into the protocol.
+func (a *Agent) runKeygen(ctx context.Context, sid string, ip *InitPayload) (*store.Share, error) {
+	sortedIDs := SortedPartyIDs(ip.Peers)
+	myID := findMyPartyID(sortedIDs, a.SpotID())
+	if myID == nil {
+		return nil, errors.New("keygen: this agent's PartyID could not be located")
+	}
+	peerCtx := tss.NewPeerContext(sortedIDs)
+	params := tss.NewParameters(tss.Edwards(), peerCtx, myID, len(sortedIDs), ip.Threshold)
+
+	session := &Session{
+		ID:     sid,
+		Kind:   SessionKeygen,
+		Peers:  ip.Peers,
+		Self:   myID,
+		doneCh: make(chan struct{}),
+	}
+	session.broker = newSpotBroker(myID, a.makeWireSend(session))
+	params.SetBroker(session.broker)
+
+	a.registry.Put(session)
+	defer a.registry.Drop(sid)
+
+	kg, err := eddsatss.NewKeygen(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("eddsatss keygen start: %w", err)
+	}
+
+	select {
+	case k := <-kg.Done:
+		session.finish(nil)
+		return saveDataFromKey(sid, ip, k), nil
+	case err := <-kg.Err:
+		session.finish(err)
+		return nil, err
+	case <-session.doneCh:
+		return nil, session.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-// saveDataToShare wraps tss-lib's output in our on-disk schema.
-func saveDataToShare(sid string, peers []PeerSpec, threshold int, data *keygen.LocalPartySaveData) *store.Share {
-	keys := make([]*big.Int, 0, len(peers))
-	spotIDs := make([]string, 0, len(peers))
-	sorted := SortedPartyIDs(peers)
+// makeWireSend returns the outbound JsonMessage publisher closure used by the
+// session broker. Broadcasts fan out to every peer except self with suffix
+// `broadcast`; p2p messages target a single peer with suffix `single`.
+//
+// Sender format follows the wdrone convention: `<my_spot_id>/<sid>/<my_party_id>`.
+func (a *Agent) makeWireSend(s *Session) func(context.Context, *tss.JsonMessage) {
+	return func(ctx context.Context, jm *tss.JsonMessage) {
+		body, err := json.Marshal(jm)
+		if err != nil {
+			a.log.Error("walletsign: marshal outbound", "sid", s.ID, "err", err)
+			return
+		}
+		partyID := ""
+		if jm.From != nil {
+			partyID = jm.From.Id
+		}
+		if jm.To == nil {
+			for _, p := range s.Peers {
+				if p.SpotID == a.SpotID() {
+					continue
+				}
+				if err := a.sendWalletSign(ctx, p.SpotID, s.ID, "broadcast", partyID, body); err != nil {
+					a.log.Error("walletsign: broadcast", "to", p.SpotID, "sid", s.ID, "err", err)
+				}
+			}
+			return
+		}
+		// p2p: msg.To.Id is the peer's Spot id (PartyID.Id == SpotID).
+		if jm.To.Id == a.SpotID() {
+			return
+		}
+		if err := a.sendWalletSign(ctx, jm.To.Id, s.ID, "single", partyID, body); err != nil {
+			a.log.Error("walletsign: p2p", "to", jm.To.Id, "sid", s.ID, "err", err)
+		}
+	}
+}
+
+// saveDataFromKey wraps an eddsatss.Key plus session metadata in our on-disk
+// share schema. The `WalletID` is left as the server-issued sid for traceability;
+// callers may overwrite it with the canonical crws- id when known.
+func saveDataFromKey(sid string, ip *InitPayload, k *eddsatss.Key) *store.Share {
+	if k == nil {
+		return nil
+	}
+	keys := make([]*big.Int, 0, len(ip.Peers))
+	spotIDs := make([]string, 0, len(ip.Peers))
+	sorted := SortedPartyIDs(ip.Peers)
 	for _, p := range sorted {
 		keys = append(keys, p.KeyInt())
 		spotIDs = append(spotIDs, p.Id)
 	}
+	walletID := ip.WalletID
+	if walletID == "" {
+		walletID = sid
+	}
 	sh := &store.Share{
-		WalletID:    sid,
-		PartyKey:    nil, // filled by caller via findMyPartyID if needed
+		WalletID:    walletID,
 		PeerKeys:    keys,
 		PeerSpotIDs: spotIDs,
-		Threshold:   threshold,
-		SaveData:    data,
+		Threshold:   ip.Threshold,
+		EDKey:       k,
 	}
-	if data != nil && data.EDDSAPub != nil {
-		sh.PubKey = store.EdPointBytes(data.EDDSAPub)
+	if k.EDDSAPub != nil {
+		sh.PubKey = store.EdPointBytes(k.EDDSAPub)
 	}
 	return sh
-}
-
-// broadcastInit sends the InitPayload to every peer except us.
-func (a *Agent) broadcastInit(ctx context.Context, sid string, peers []PeerSpec, payload *InitPayload) error {
-	pb, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	body, err := json.Marshal(WalletEnvelope{
-		Action:     WalletInit,
-		SessionID:  sid,
-		FromSpotID: a.SpotID(),
-		Payload:    pb,
-	})
-	if err != nil {
-		return err
-	}
-	for _, p := range peers {
-		if p.SpotID == a.SpotID() {
-			continue
-		}
-		sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := a.client.SendToWithFrom(sendCtx, p.SpotID+"/wallet", body, "wallet")
-		cancel()
-		if err != nil {
-			return fmt.Errorf("init send to %s: %w", p.SpotID, err)
-		}
-	}
-	return nil
 }
 
 func containsSpotID(peers []PeerSpec, id string) bool {
@@ -194,4 +197,3 @@ func findMyPartyID(sorted tss.SortedPartyIDs, mySpot string) *tss.PartyID {
 	}
 	return nil
 }
-

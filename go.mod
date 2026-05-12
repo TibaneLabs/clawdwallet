@@ -5,11 +5,11 @@ go 1.25.3
 require (
 	github.com/BottleFmt/gobottle v1.0.1
 	github.com/KarpelesLab/outscript v0.3.29
+	github.com/KarpelesLab/rest v0.6.15
 	github.com/KarpelesLab/spotlib v0.3.0
 	github.com/KarpelesLab/spotproto v0.3.0
-	github.com/KarpelesLab/tss-lib/v2 v2.1.6
+	github.com/KarpelesLab/tss-lib/v2 v2.2.4
 	github.com/fxamacker/cbor/v2 v2.9.1
-	github.com/google/uuid v1.6.0
 )
 
 require (
@@ -19,7 +19,6 @@ require (
 	github.com/KarpelesLab/emitter v0.3.0 // indirect
 	github.com/KarpelesLab/mldsa v0.2.0 // indirect
 	github.com/KarpelesLab/pjson v0.2.0 // indirect
-	github.com/KarpelesLab/rest v0.6.15 // indirect
 	github.com/KarpelesLab/rlp v0.1.4 // indirect
 	github.com/KarpelesLab/secp256k1 v0.2.8 // indirect
 	github.com/KarpelesLab/slhdsa v0.1.0 // indirect
@@ -27,8 +26,7 @@ require (
 	github.com/KarpelesLab/webutil v0.2.7 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/hashicorp/errwrap v1.0.0 // indirect
-	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/ipfs/go-log v1.0.5 // indirect
 	github.com/ipfs/go-log/v2 v2.1.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect

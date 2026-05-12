@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,6 +178,30 @@ func (a *Agent) SetLocked(v bool) {
 	a.mu.Unlock()
 }
 
+// sendWalletSign delivers `body` to `<target>/walletsign/<sid>/<suffix>` with
+// a sender path matching the wdrone convention (`<my_spot_id>/<sid>/<my_party_id>`
+// for routed frames, `<my_spot_id>/walletsign/<sid>` otherwise).
+//
+// `partyID` may be empty (e.g. init), in which case the sender path is the
+// bare walletsign form.
+func (a *Agent) sendWalletSign(ctx context.Context, target, sid, suffix, partyID string, body []byte) error {
+	if a.client == nil {
+		return errors.New("agent not started")
+	}
+	mySpot := a.SpotID()
+	tgt := target + "/walletsign/" + sid
+	if suffix != "" {
+		tgt += "/" + suffix
+	}
+	sender := mySpot + "/walletsign/" + sid
+	if partyID != "" {
+		sender = mySpot + "/" + sid + "/" + partyID
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return a.client.SendToWithFrom(callCtx, tgt, body, sender)
+}
+
 // SolanaAddress returns the base58 Solana wallet address, or "" if not yet known.
 func (a *Agent) SolanaAddress() string {
 	sh := a.Share()
@@ -189,45 +214,62 @@ func (a *Agent) SolanaAddress() string {
 }
 
 // handlers returns the static Spot handler set registered at client construction.
-// (SetHandler can also be called later if needed.)
+//
+// `walletsign` is the canonical TSS-over-Spot endpoint shared with wdrone and
+// libwallet (see CLAWDWALLET_STAGE1.md §"Cross-component contracts").
+// `agent`, `policy`, `owner` remain Stage-2 placeholders kept registered so a
+// stale peer gets a useful error rather than dropped traffic.
 func (a *Agent) handlers() map[string]spotlib.MessageHandler {
 	return map[string]spotlib.MessageHandler{
-		"wallet": a.handleWallet,
-		"agent":  a.handleAgent,
-		"policy": a.handlePolicy,
-		"owner":  a.handleOwner,
+		"walletsign": a.handleWalletSign,
+		"agent":      a.handleAgent,
+		"policy":     a.handlePolicy,
+		"owner":      a.handleOwner,
 	}
 }
 
-// handleWallet dispatches TSS init/broadcast messages.
-func (a *Agent) handleWallet(msg *spotproto.Message) ([]byte, error) {
-	var env WalletEnvelope
-	if err := json.Unmarshal(msg.Body, &env); err != nil {
-		return nil, fmt.Errorf("decode wallet envelope: %w", err)
+// handleWalletSign processes inbound TSS messages.
+//
+// The recipient path is `<my_spot_id>/walletsign/<sid>[/<init|broadcast|single>]`
+// (see wdrone/walletsign.go for the canonical implementation we mirror).
+// `init` carries a bare InitPayload JSON. `broadcast` and `single` (and any
+// other trailing segment) carry a bare `tss.JsonMessage` JSON which we feed
+// straight into the session's broker for local dispatch.
+func (a *Agent) handleWalletSign(msg *spotproto.Message) ([]byte, error) {
+	if msg == nil {
+		return nil, nil
 	}
-	switch env.Action {
-	case WalletInit:
+	parts := strings.Split(msg.Recipient, "/")
+	// expect at minimum <id>/walletsign/<sid>
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("walletsign: bad recipient %q", msg.Recipient)
+	}
+	sid := parts[2]
+	if sid == "" {
+		return nil, fmt.Errorf("walletsign: empty sid in recipient %q", msg.Recipient)
+	}
+
+	// Init message: bare InitPayload JSON, body decoded and dispatched per kind.
+	if len(parts) >= 4 && parts[3] == "init" {
 		var ip InitPayload
-		if err := json.Unmarshal(env.Payload, &ip); err != nil {
+		if err := json.Unmarshal(msg.Body, &ip); err != nil {
 			return nil, fmt.Errorf("decode init payload: %w", err)
 		}
-		return a.onInit(env.SessionID, env.FromSpotID, &ip)
-	case WalletBroadcast:
-		var bp BroadcastPayload
-		if err := json.Unmarshal(env.Payload, &bp); err != nil {
-			return nil, fmt.Errorf("decode broadcast payload: %w", err)
-		}
-		s := a.registry.Get(env.SessionID)
-		if s == nil {
-			return nil, fmt.Errorf("unknown session %s", env.SessionID)
-		}
-		if err := s.dispatchWire(env.FromSpotID, &bp); err != nil {
-			return nil, err
-		}
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unknown wallet action %q", env.Action)
+		return a.onInit(sid, msg.Sender, &ip)
 	}
+
+	// Otherwise this is a wire frame for an already-initialised session.
+	s := a.registry.Get(sid)
+	if s == nil {
+		return nil, fmt.Errorf("walletsign: unknown session %s", sid)
+	}
+	if s.broker == nil {
+		return nil, fmt.Errorf("walletsign: session %s has no broker", sid)
+	}
+	if err := s.broker.dispatchInbound(msg.Body); err != nil {
+		return nil, fmt.Errorf("walletsign: dispatch %s: %w", sid, err)
+	}
+	return nil, nil
 }
 
 // AgentEnvelope is the JSON shape for control messages on the "agent" endpoint.
@@ -271,12 +313,12 @@ func (a *Agent) handleAgent(msg *spotproto.Message) ([]byte, error) {
 			Moniker:  a.cfg.Moniker,
 		})
 	case "clarify":
-		// In production this would be plumbed into the agent's planning loop
-		// so the model can produce a contextual explanation. For now we echo a
-		// minimal acknowledgement so the policy evaluator can proceed.
-		return json.Marshal(map[string]any{
-			"answer": "agent operating within configured skill manifest; no additional context available",
-		})
+		// Stage 2: clarification dialog (Grok-driven escalation) is deferred.
+		// Stage 1 has no Grok evaluator, no skill manifest, and no owner
+		// dialog flow; the policy module decides hard-rules-only and never
+		// asks the agent to elaborate. We return a deterministic stub so an
+		// older policy peer doesn't spin on an empty response.
+		return nil, fmt.Errorf("clarify is Stage 2 — not enabled")
 	default:
 		return nil, fmt.Errorf("unknown agent action %q", env.Action)
 	}

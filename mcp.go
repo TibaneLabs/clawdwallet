@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -11,9 +12,14 @@ import (
 )
 
 func init() {
+	if os.Getenv("CLAWDWALLET_ENABLE_MCP") == "" {
+		// Stage 2: MCP server is deferred so the Stage 1 demo CLI surface
+		// stays minimal and predictable.
+		return
+	}
 	register(&command{
 		name:  "mcp",
-		short: "Run an MCP server on stdio (JSON-RPC 2.0)",
+		short: "(Stage 2) Run an MCP server on stdio (JSON-RPC 2.0)",
 		run:   runMCP,
 	})
 }
