@@ -41,6 +41,7 @@ type Agent struct {
 	store    *store.Store
 	rpc      *solana.Client
 	registry *SessionRegistry
+	pairing  *PairingRegistry
 
 	mu     sync.RWMutex
 	share  *store.Share // nil until keygen completes / on disk-load
@@ -86,6 +87,7 @@ func New(opts Options) (*Agent, error) {
 		store:    st,
 		rpc:      solana.NewClient(opts.Config.SolanaRPC),
 		registry: NewSessionRegistry(),
+		pairing:  NewPairingRegistry(),
 		ctx:      ctx,
 		cancel:   cancel,
 		log:      opts.Logger,
@@ -122,7 +124,15 @@ func (a *Agent) Stop() {
 	if a.client != nil {
 		_ = a.client.Close()
 	}
+	if a.pairing != nil {
+		a.pairing.Close()
+	}
 }
+
+// Pairing returns the in-memory pairing token registry. Used by the `pair`
+// CLI subcommand to issue tokens; the agent itself consumes them through the
+// `pair` Spot endpoint.
+func (a *Agent) Pairing() *PairingRegistry { return a.pairing }
 
 // Ctx returns the agent's context. It is cancelled by Stop.
 func (a *Agent) Ctx() context.Context { return a.ctx }
@@ -225,6 +235,7 @@ func (a *Agent) handlers() map[string]spotlib.MessageHandler {
 		"agent":      a.handleAgent,
 		"policy":     a.handlePolicy,
 		"owner":      a.handleOwner,
+		"pair":       a.handlePair,
 	}
 }
 
