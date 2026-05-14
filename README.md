@@ -63,10 +63,11 @@ clawdwallet pair
 ```
 
 This prints a single-use URL of the form
-`tibane://pair?agent=<your-spot-id>&token=<one-shot>`. Give the URL to your
-human (printed in the terminal, or via whatever channel you have with
-them — chat, copy-paste, a QR they scan). The token is valid for 5 minutes
-and dies on first use; if they miss the window, run `pair` again.
+`tibane://pair?agent=<your-spot-id>&token=<one-shot>` along with a unicode
+QR code rendering of the same URL. Give either to your human — they can
+scan the QR from the terminal directly, or you can paste the URL through
+whatever channel you share with them. The token is valid for 5 minutes and
+dies on first use; if they miss the window, run `pair` again.
 
 When they tap the URL, the mobile verifies you over Spot and the `pair`
 command exits with the mobile's Spot id printed. That is your confirmation

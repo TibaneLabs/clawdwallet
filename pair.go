@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mdp/qrterminal/v3"
+
 	"github.com/TibaneLabs/clawdwallet/agent"
 	"github.com/TibaneLabs/clawdwallet/config"
 )
@@ -43,7 +45,9 @@ func runPair(args []string) error {
 	}
 	url := agent.PairingURL(a.SpotID(), token)
 
-	fmt.Println("Open this URL on your phone to pair the mobile app with this agent:")
+	fmt.Println("Scan this QR or open the URL on your phone to pair the mobile app with this agent:")
+	fmt.Println()
+	qrterminal.GenerateHalfBlock(url, qrterminal.L, os.Stdout)
 	fmt.Println()
 	fmt.Println("  " + url)
 	fmt.Println()

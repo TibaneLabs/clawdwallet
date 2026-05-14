@@ -30,6 +30,7 @@ require (
 	github.com/ipfs/go-log v1.0.5 // indirect
 	github.com/ipfs/go-log/v2 v2.1.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/mdp/qrterminal/v3 v3.2.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
@@ -37,6 +38,8 @@ require (
 	go.uber.org/zap v1.16.0 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/term v0.41.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
+	rsc.io/qr v0.2.0 // indirect
 )
