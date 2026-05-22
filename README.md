@@ -1,5 +1,9 @@
 # clawdwallet
 
+[![Test](https://github.com/TibaneLabs/clawdwallet/actions/workflows/test.yml/badge.svg)](https://github.com/TibaneLabs/clawdwallet/actions/workflows/test.yml)
+[![Coverage Status](https://coveralls.io/repos/github/TibaneLabs/clawdwallet/badge.svg?branch=master)](https://coveralls.io/github/TibaneLabs/clawdwallet?branch=master)
+[![Go Report Card](https://goreportcard.com/badge/github.com/TibaneLabs/clawdwallet)](https://goreportcard.com/report/github.com/TibaneLabs/clawdwallet)
+
 Agent-side runtime for the **ClawdWallet** TSS custody wallet on Solana. This
 binary is the **Agent Process** — the party that holds **Share 1** of a 2-of-3
 EdDSA threshold signature, talks to the Policy Evaluator and Owner Mobile

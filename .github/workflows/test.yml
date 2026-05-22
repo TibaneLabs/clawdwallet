@@ -30,4 +30,16 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./... -race -count=1
+        # -coverprofile writes Go's native coverage format; -covermode=atomic
+        # is required when -race is on (the default count mode is not
+        # race-safe). The same invocation is used locally — see README.
+        run: go test ./... -race -count=1 -covermode=atomic -coverprofile=coverage.out
+
+      - name: Coveralls
+        # Official Coveralls action; format=golang tells it to read Go's
+        # native coverage profile rather than LCOV. The action picks up
+        # GITHUB_TOKEN automatically for public repos.
+        uses: coverallsapp/github-action@v2
+        with:
+          file: coverage.out
+          format: golang
