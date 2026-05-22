@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,7 +9,8 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/KarpelesLab/tss-lib/v2/eddsatss"
+	"github.com/KarpelesLab/tss-lib/v2/dklstss"
+	"github.com/KarpelesLab/tss-lib/v2/frosttss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 
 	"github.com/TibaneLabs/clawdwallet/solana"
@@ -17,9 +19,9 @@ import (
 
 // onInit handles an inbound `<my_spot_id>/walletsign/<sid>/init` message.
 //
-// Per Stage 1 the agent is JOIN-only: it accepts the server-issued session id,
-// runs the appropriate `eddsatss` ceremony, and persists the result. Stage-2
-// reshare and any other initiator-side flow are deferred.
+// The agent is JOIN-only: it accepts the server-issued session id, runs the
+// `(curve, protocol)`-dispatched ceremony, and persists the result. Stage-2
+// reshare is still gated.
 func (a *Agent) onInit(sid, from string, ip *InitPayload) ([]byte, error) {
 	switch ip.Kind {
 	case SessionKeygen:
@@ -30,18 +32,18 @@ func (a *Agent) onInit(sid, from string, ip *InitPayload) ([]byte, error) {
 		return []byte(`{"accepted":true}`), nil
 	case SessionReshare:
 		// Stage 2: reshare is flag-gated; reject early so the demo path is
-		// deterministic. The reshare driver is still present but unwired.
+		// deterministic.
 		return nil, errors.New("reshare ceremonies are not enabled in Stage 1")
 	default:
 		return nil, fmt.Errorf("unknown session kind %q", ip.Kind)
 	}
 }
 
-// joinKeygen drives an `eddsatss.NewKeygen` party for the server-issued sid.
+// joinKeygen drives a FROST or DKLs23 keygen for the server-issued sid.
 //
-// The InitPayload carries the full peer set and threshold; the agent sorts
-// them deterministically and dispatches outbound JsonMessages over Spot using
-// the walletsign recipient convention.
+// The InitPayload carries the full peer set, curve, protocol, and threshold;
+// the agent sorts the peers deterministically and dispatches outbound
+// JsonMessages over Spot using the walletsign recipient convention.
 func (a *Agent) joinKeygen(sid string, ip *InitPayload) {
 	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Minute)
 	defer cancel()
@@ -58,27 +60,37 @@ func (a *Agent) joinKeygen(sid string, ip *InitPayload) {
 	}
 
 	a.cfg.WalletID = share.WalletID
-	a.cfg.SolanaAddress, _ = solana.AddressFromPubKey(share.SolanaAddressBytes())
+	if addrBytes := share.SolanaAddressBytes(); addrBytes != nil {
+		a.cfg.SolanaAddress, _ = solana.AddressFromPubKey(addrBytes)
+	}
 	if err := a.cfg.Save(); err != nil {
 		a.log.Warn("joinKeygen: persist config", "err", err)
 	}
 	if err := a.SetShare(share); err != nil {
 		a.log.Error("joinKeygen: persist share", "err", err)
 	}
-	a.log.Info("keygen complete", "sid", sid, "address", a.cfg.SolanaAddress)
+	a.log.Info("keygen complete",
+		"sid", sid,
+		"schema", share.Schema,
+		"address", a.cfg.SolanaAddress,
+	)
 }
 
-// runKeygen instantiates an eddsatss.NewKeygen tied to a per-session
-// spotBroker. The broker bridges the protocol's outbound JsonMessages to the
-// walletsign Spot path, and feeds inbound peer frames back into the protocol.
+// runKeygen sets up the broker and tss.Parameters, then dispatches to the
+// FROST or DKLs23 runner per the InitPayload's (curve, protocol).
 func (a *Agent) runKeygen(ctx context.Context, sid string, ip *InitPayload) (*store.Share, error) {
+	curve, curveName, protocolName, err := resolveCurveProtocol(ip.Curve, ip.Protocol)
+	if err != nil {
+		return nil, fmt.Errorf("keygen: %w", err)
+	}
+
 	sortedIDs := SortedPartyIDs(ip.Peers)
 	myID := findMyPartyID(sortedIDs, a.SpotID())
 	if myID == nil {
 		return nil, errors.New("keygen: this agent's PartyID could not be located")
 	}
 	peerCtx := tss.NewPeerContext(sortedIDs)
-	params := tss.NewParameters(tss.Edwards(), peerCtx, myID, len(sortedIDs), ip.Threshold)
+	params := tss.NewParameters(curve, peerCtx, myID, len(sortedIDs), ip.Threshold)
 
 	session := &Session{
 		ID:     sid,
@@ -93,15 +105,54 @@ func (a *Agent) runKeygen(ctx context.Context, sid string, ip *InitPayload) (*st
 	a.registry.Put(session)
 	defer a.registry.Drop(sid)
 
-	kg, err := eddsatss.NewKeygen(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("eddsatss keygen start: %w", err)
-	}
+	a.log.Info("keygen starting",
+		"sid", sid, "curve", curveName, "protocol", protocolName,
+		"parties", len(sortedIDs), "threshold", ip.Threshold,
+	)
 
+	switch protocolName {
+	case ProtocolFrost:
+		return a.runKeygenFrost(ctx, sid, ip, session, params)
+	case ProtocolDkls23:
+		return a.runKeygenDkls(ctx, sid, ip, session, params)
+	default:
+		return nil, fmt.Errorf("keygen: protocol %q is not wired", protocolName)
+	}
+}
+
+// runKeygenFrost runs a FROST(Ed25519) DKG (Pedersen DKG per RFC 9591
+// Appendix D) and returns a SchemaFrost share.
+func (a *Agent) runKeygenFrost(ctx context.Context, sid string, ip *InitPayload, session *Session, params *tss.Parameters) (*store.Share, error) {
+	kg, err := frosttss.NewKeygen(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("frosttss keygen start: %w", err)
+	}
 	select {
 	case k := <-kg.Done:
 		session.finish(nil)
-		return saveDataFromKey(sid, ip, k), nil
+		return saveFrostShare(sid, ip, k), nil
+	case err := <-kg.Err:
+		session.finish(err)
+		return nil, err
+	case <-session.doneCh:
+		return nil, session.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// runKeygenDkls runs a DKLs23 DKG (Feldman VSS) and returns a SchemaDkls23
+// share. The dklstss.Key is serialised via Save() and stored verbatim — see
+// store.Share.DklsBlob.
+func (a *Agent) runKeygenDkls(ctx context.Context, sid string, ip *InitPayload, session *Session, params *tss.Parameters) (*store.Share, error) {
+	kg, err := dklstss.NewKeygen(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("dklstss keygen start: %w", err)
+	}
+	select {
+	case k := <-kg.Done:
+		session.finish(nil)
+		return saveDklsShare(sid, ip, k)
 	case err := <-kg.Err:
 		session.finish(err)
 		return nil, err
@@ -149,35 +200,79 @@ func (a *Agent) makeWireSend(s *Session) func(context.Context, *tss.JsonMessage)
 	}
 }
 
-// saveDataFromKey wraps an eddsatss.Key plus session metadata in our on-disk
-// share schema. The `WalletID` is left as the server-issued sid for traceability;
-// callers may overwrite it with the canonical crws- id when known.
-func saveDataFromKey(sid string, ip *InitPayload, k *eddsatss.Key) *store.Share {
+// saveFrostShare wraps a frosttss.Key plus session metadata in our on-disk
+// SchemaFrost share. The Solana address is derived from GroupPublicKey.
+func saveFrostShare(sid string, ip *InitPayload, k *frosttss.Key) *store.Share {
 	if k == nil {
 		return nil
 	}
-	keys := make([]*big.Int, 0, len(ip.Peers))
-	spotIDs := make([]string, 0, len(ip.Peers))
-	sorted := SortedPartyIDs(ip.Peers)
-	for _, p := range sorted {
-		keys = append(keys, p.KeyInt())
-		spotIDs = append(spotIDs, p.Id)
-	}
-	walletID := ip.WalletID
-	if walletID == "" {
-		walletID = sid
-	}
 	sh := &store.Share{
-		WalletID:    walletID,
-		PeerKeys:    keys,
-		PeerSpotIDs: spotIDs,
+		WalletID:    walletIDOrSid(ip, sid),
+		Schema:      store.SchemaFrost,
+		PeerKeys:    sharedPeerKeys(ip.Peers),
+		PeerSpotIDs: sharedPeerSpotIDs(ip.Peers),
 		Threshold:   ip.Threshold,
-		EDKey:       k,
+		FrostKey:    k,
 	}
-	if k.EDDSAPub != nil {
-		sh.PubKey = store.EdPointBytes(k.EDDSAPub)
+	if k.GroupPublicKey != nil {
+		sh.PubKey = store.EdPointBytes(k.GroupPublicKey)
 	}
 	return sh
+}
+
+// saveDklsShare wraps a dklstss.Key plus session metadata in our on-disk
+// SchemaDkls23 share. The secp256k1 public key is recorded as the
+// SEC1-compressed (33-byte) form so callers can derive Bitcoin / Ethereum
+// addresses without re-loading the share.
+func saveDklsShare(sid string, ip *InitPayload, k *dklstss.Key) (*store.Share, error) {
+	if k == nil {
+		return nil, errors.New("dklstss keygen returned nil key")
+	}
+	var buf bytes.Buffer
+	if err := k.Save(&buf); err != nil {
+		return nil, fmt.Errorf("dklstss.Key.Save: %w", err)
+	}
+	sh := &store.Share{
+		WalletID:    walletIDOrSid(ip, sid),
+		Schema:      store.SchemaDkls23,
+		PeerKeys:    sharedPeerKeys(ip.Peers),
+		PeerSpotIDs: sharedPeerSpotIDs(ip.Peers),
+		Threshold:   ip.Threshold,
+		DklsBlob:    buf.Bytes(),
+	}
+	if k.ECDSAPub != nil {
+		if pub := k.ECDSAPub.ToSecp256k1PubKey(); pub != nil {
+			sh.Secp256k1Pub = pub.SerializeCompressed()
+		}
+	}
+	return sh, nil
+}
+
+// walletIDOrSid prefers the policy-issued wallet id, falling back to the sid
+// so a freshly generated share still has a stable identifier.
+func walletIDOrSid(ip *InitPayload, sid string) string {
+	if ip.WalletID != "" {
+		return ip.WalletID
+	}
+	return sid
+}
+
+// sharedPeerKeys is the per-peer big.Int slot list both share schemas hold.
+func sharedPeerKeys(peers []PeerSpec) []*big.Int {
+	out := make([]*big.Int, 0, len(peers))
+	for _, p := range SortedPartyIDs(peers) {
+		out = append(out, p.KeyInt())
+	}
+	return out
+}
+
+// sharedPeerSpotIDs is the per-peer Spot identity list both share schemas hold.
+func sharedPeerSpotIDs(peers []PeerSpec) []string {
+	out := make([]string, 0, len(peers))
+	for _, p := range SortedPartyIDs(peers) {
+		out = append(out, p.Id)
+	}
+	return out
 }
 
 func containsSpotID(peers []PeerSpec, id string) bool {

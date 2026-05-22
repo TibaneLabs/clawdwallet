@@ -2,30 +2,32 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"time"
 
+	"github.com/KarpelesLab/tss-lib/v2/dklstss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 
 	"github.com/TibaneLabs/clawdwallet/store"
 )
 
 // wdroneTxsignInit is the wire shape wdrone's walletsign session.init parses
-// for a `txsign` ceremony (see wdrone/walletsign.go:77 walletSignTxsignInit).
+// for a `txsign` ceremony (see wdrone/walletsign.go walletSignTxsignInit).
 //
-// We construct this per-recipient (Name is the recipient's own PartyID) before
-// posting `<peer>/walletsign/<sid>/init`. The Peers list is the same sorted
-// set for every recipient.
+// We construct this per-recipient (Name is the recipient's own PartyID)
+// before posting `<peer>/walletsign/<sid>/init`. The Peers list is the same
+// sorted set for every recipient. Protocol selects FROST vs DKLs23 on the
+// receiver side (clawdwallet only speaks those two; the legacy GG18 paths
+// are absent here).
 type wdroneTxsignInit struct {
 	Peers     tss.SortedPartyIDs `json:"peers"`
 	Name      *tss.PartyID       `json:"name"`
 	Threshold int                `json:"threshold"`
 	Curve     string             `json:"curve"`
+	Protocol  string             `json:"protocol,omitempty"`
 	Digest    string             `json:"digest,omitempty"`
 	// SID is informational; wdrone reads it from the path.
 	SID string `json:"sid,omitempty"`
@@ -33,20 +35,22 @@ type wdroneTxsignInit struct {
 	Type string `json:"type,omitempty"`
 }
 
-// SignDigest runs a t+1-of-n TSS signing ceremony over the given digest using
-// the persisted share. The returned signature is a standard 64-byte Ed25519
-// signature.
+// SignDigest runs a t+1-of-n TSS signing ceremony over the given digest
+// using the persisted share. The result encoding depends on the share's
+// schema:
+//
+//   - FROST(Ed25519): 64-byte R||S, identical to a standard Ed25519
+//     signature; verifiable by any Ed25519 verifier under the share's
+//     GroupPublicKey (the Solana address).
+//   - DKLs23(secp256k1): 65-byte R||S||V (V is the public recovery byte),
+//     matching wdrone's compact format for Ethereum-style verifiers.
 //
 // `sid` is the session id issued by the phplatform policy module's
-// `:signRequest` response (derived from the crwsv- portion of `remote_key`).
-// `signers` must list exactly t+1 peers including this agent (Stage-1 default
-// is agent + wdrone; mobile sits out of signing).
-//
-// Per the integration-phase contract the **agent leads the sign ceremony**:
-// it registers its own walletsign handler (statically armed at construction;
-// the broker is wired by runSign before any peer can know the sid), sends
-// `<peer>/walletsign/<sid>/init` to every co-signer with a wdrone-compatible
-// init payload, then drives the local eddsatss.Signing to completion.
+// `:signRequest` response. `signers` lists exactly t+1 peers including this
+// agent. The agent leads the ceremony: it registers its broker before any
+// peer can know the sid, posts `<peer>/walletsign/<sid>/init` with a
+// wdrone-compatible payload (including the matching `protocol`), then drives
+// the local signer to completion.
 func (a *Agent) SignDigest(ctx context.Context, sid string, digest []byte, signers []PeerSpec) ([]byte, error) {
 	if a.client == nil {
 		return nil, errors.New("agent not started")
@@ -68,8 +72,14 @@ func (a *Agent) SignDigest(ctx context.Context, sid string, digest []byte, signe
 		return nil, fmt.Errorf("sign: need at least %d signers, got %d", sh.Threshold+1, len(signers))
 	}
 
-	// Build the sorted PartyID list once: every recipient gets the same Peers
-	// list, only the `name` field changes (it's the recipient's own PartyID).
+	curveName, protocolName, err := protocolForSchema(sh.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("sign: %w", err)
+	}
+
+	// Build the sorted PartyID list once: every recipient gets the same
+	// Peers list, only the `name` field changes (it's the recipient's own
+	// PartyID).
 	sortedIDs := SortedPartyIDs(signers)
 	myID := findMyPartyID(sortedIDs, a.SpotID())
 	if myID == nil {
@@ -78,10 +88,10 @@ func (a *Agent) SignDigest(ctx context.Context, sid string, digest []byte, signe
 
 	// Pre-register the session BEFORE shipping init messages so the global
 	// walletsign handler has a broker to route inbound frames into. Without
-	// this, a fast wdrone could broadcast round-1 frames before runSign
+	// this, a fast peer could broadcast round-1 frames before runSign
 	// publishes the session, and the agent's handler would reject them with
 	// "unknown session". The broker is wired here; runSign attaches it to
-	// the eddsatss params and drives the protocol.
+	// the params and drives the protocol.
 	session := &Session{
 		ID:     sid,
 		Kind:   SessionSign,
@@ -105,7 +115,8 @@ func (a *Agent) SignDigest(ctx context.Context, sid string, digest []byte, signe
 			Peers:     sortedIDs,
 			Name:      peerPid,
 			Threshold: sh.Threshold,
-			Curve:     "ed25519",
+			Curve:     curveName,
+			Protocol:  protocolName,
 			// wdrone's decodeDigest accepts hex (with or without 0x prefix)
 			// or base64url — we emit hex so it round-trips through the
 			// legacy "<hash_hex>:<il_hex>:<curve>" fallback parser too.
@@ -124,15 +135,39 @@ func (a *Agent) SignDigest(ctx context.Context, sid string, digest []byte, signe
 		}
 		a.log.Info("walletsign txsign init sent",
 			"sid", sid, "to", p.SpotID, "moniker", p.Moniker,
+			"protocol", protocolName, "curve", curveName,
 			"peers", len(sortedIDs), "threshold", sh.Threshold)
 	}
 
 	return a.runSignWithSession(ctx, session, sortedIDs, myID, sh, digest)
 }
 
-// marshalLeaderInit is exported via test-build seam for unit tests: it
-// produces the exact JSON body the leader posts to a single recipient.
+// protocolForSchema maps a Share.Schema to the (curve, protocol) pair the
+// wire init payload should advertise. Mirrors the matrix in
+// resolveCurveProtocol.
+func protocolForSchema(schema string) (curve, protocol string, err error) {
+	switch schema {
+	case store.SchemaFrost:
+		return CurveEd25519, ProtocolFrost, nil
+	case store.SchemaDkls23:
+		return CurveSecp256k1, ProtocolDkls23, nil
+	default:
+		return "", "", fmt.Errorf("unsupported share schema %q", schema)
+	}
+}
+
+// marshalLeaderInit is exposed for unit tests: it produces the exact JSON
+// body the leader posts to a single recipient. Defaults to a FROST(Ed25519)
+// envelope when no protocol is supplied (matches the Solana-default share
+// schema).
 func marshalLeaderInit(sid string, signers []PeerSpec, recipient PeerSpec, threshold int, digest []byte) ([]byte, error) {
+	return marshalLeaderInitFor(sid, signers, recipient, threshold, digest, CurveEd25519, ProtocolFrost)
+}
+
+// marshalLeaderInitFor lets callers pick the (curve, protocol) pair
+// advertised in the wire init body. Used by tests and by SignDigest when
+// dispatching DKLs23 leaders.
+func marshalLeaderInitFor(sid string, signers []PeerSpec, recipient PeerSpec, threshold int, digest []byte, curve, protocol string) ([]byte, error) {
 	sortedIDs := SortedPartyIDs(signers)
 	peerPid := findMyPartyID(sortedIDs, recipient.SpotID)
 	if peerPid == nil {
@@ -142,7 +177,8 @@ func marshalLeaderInit(sid string, signers []PeerSpec, recipient PeerSpec, thres
 		Peers:     sortedIDs,
 		Name:      peerPid,
 		Threshold: threshold,
-		Curve:     "ed25519",
+		Curve:     curve,
+		Protocol:  protocol,
 		Digest:    hex.EncodeToString(digest),
 		SID:       sid,
 		Type:      string(SessionSign),
@@ -151,11 +187,11 @@ func marshalLeaderInit(sid string, signers []PeerSpec, recipient PeerSpec, thres
 }
 
 // joinSign accepts an inbound init for a `txsign` session driven by a peer
-// initiator. Per the Stage-1 integration contract the agent is the sign
-// LEADER (see SignDigest); joinSign exists as a safety net for the inverse
-// case where another peer happens to lead a sign ceremony the agent has been
-// invited into (e.g. a test harness). The resulting signature is not returned
-// here — callers that need it must observe the session via the registry.
+// initiator. clawdwallet is normally the sign LEADER (see SignDigest);
+// joinSign exists as a safety net for the inverse case where another peer
+// happens to lead a sign ceremony the agent has been invited into (e.g. a
+// test harness). The resulting signature is not returned here — callers
+// that need it must observe the session via the registry.
 func (a *Agent) joinSign(sid string, ip *InitPayload) {
 	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Minute)
 	defer cancel()
@@ -164,7 +200,7 @@ func (a *Agent) joinSign(sid string, ip *InitPayload) {
 		a.log.Error("joinSign: no share", "sid", sid)
 		return
 	}
-	digest, err := decodeSignDigest(ip.Digest)
+	digest, err := decodeDigestBytes(ip.Digest)
 	if err != nil {
 		a.log.Error("joinSign: decode digest", "sid", sid, "err", err)
 		return
@@ -174,35 +210,10 @@ func (a *Agent) joinSign(sid string, ip *InitPayload) {
 	}
 }
 
-// decodeSignDigest mirrors wdrone's decodeDigest: accept hex (with or without
-// `0x` prefix), base64-std, or base64-url. Returns the raw digest bytes.
-func decodeSignDigest(in string) ([]byte, error) {
-	if in == "" {
-		return nil, errors.New("empty digest")
-	}
-	hexCand := in
-	if len(hexCand) >= 2 && hexCand[0] == '0' && (hexCand[1] == 'x' || hexCand[1] == 'X') {
-		hexCand = hexCand[2:]
-	}
-	if b, err := hex.DecodeString(hexCand); err == nil && len(b) > 0 {
-		return b, nil
-	}
-	if b, err := base64.StdEncoding.DecodeString(in); err == nil && len(b) > 0 {
-		return b, nil
-	}
-	if b, err := base64.RawURLEncoding.DecodeString(in); err == nil && len(b) > 0 {
-		return b, nil
-	}
-	return nil, fmt.Errorf("undecodable digest %q", in)
-}
-
-// runSign is the joiner-side entry: instantiate session + broker, then drive
-// the eddsatss.Signing to completion. Used by joinSign for inbound-led sign
-// ceremonies (test harnesses / future Stage 2 flows).
+// runSign is the joiner-side entry: instantiate session + broker, then
+// dispatch to the protocol-specific runner. Used by joinSign for
+// inbound-led sign ceremonies (test harnesses / future Stage 2 flows).
 func (a *Agent) runSign(ctx context.Context, sid string, signers []PeerSpec, sh *store.Share, digest []byte) ([]byte, error) {
-	if sh.EDKey == nil {
-		return nil, errors.New("sign: share missing eddsa key data")
-	}
 	sortedIDs := SortedPartyIDs(signers)
 	myID := findMyPartyID(sortedIDs, a.SpotID())
 	if myID == nil {
@@ -220,35 +231,86 @@ func (a *Agent) runSign(ctx context.Context, sid string, signers []PeerSpec, sh 
 	return a.runSignWithSession(ctx, session, sortedIDs, myID, sh, digest)
 }
 
-// runSignWithSession runs the eddsatss.Signing using a session that is
-// already registered with its broker wired. Used by the leader path
-// (SignDigest) so the session is published *before* init messages go out,
-// closing the handler-vs-frame race for fast joiners.
+// runSignWithSession drives the schema-matched signing runner using a
+// session that is already registered with its broker wired. Used by the
+// leader path (SignDigest) so the session is published *before* init
+// messages go out, closing the handler-vs-frame race for fast joiners.
 func (a *Agent) runSignWithSession(ctx context.Context, session *Session, sortedIDs tss.SortedPartyIDs, myID *tss.PartyID, sh *store.Share, digest []byte) ([]byte, error) {
-	if sh.EDKey == nil {
-		a.registry.Drop(session.ID)
-		return nil, errors.New("sign: share missing eddsa key data")
-	}
 	defer a.registry.Drop(session.ID)
 
-	peerCtx := tss.NewPeerContext(sortedIDs)
-	params := tss.NewParameters(tss.Edwards(), peerCtx, myID, len(sortedIDs), sh.Threshold)
-	params.SetBroker(session.broker)
-
-	msgInt := new(big.Int).SetBytes(digest)
-	sg, err := sh.EDKey.NewSigning(ctx, msgInt, params)
+	curveName, protocolName, err := protocolForSchema(sh.Schema)
 	if err != nil {
-		return nil, fmt.Errorf("eddsatss signing start: %w", err)
+		return nil, err
+	}
+	curve, _, _, err := resolveCurveProtocol(curveName, protocolName)
+	if err != nil {
+		return nil, fmt.Errorf("sign: %w", err)
 	}
 
+	peerCtx := tss.NewPeerContext(sortedIDs)
+	params := tss.NewParameters(curve, peerCtx, myID, len(sortedIDs), sh.Threshold)
+	params.SetBroker(session.broker)
+
+	switch protocolName {
+	case ProtocolFrost:
+		return a.runSignFrost(ctx, session, params, sh, digest)
+	case ProtocolDkls23:
+		return a.runSignDkls(ctx, session, params, sortedIDs, sh, digest)
+	default:
+		return nil, fmt.Errorf("sign: protocol %q is not wired", protocolName)
+	}
+}
+
+// runSignFrost drives a FROST(Ed25519) signing to completion. The result is
+// the standard 64-byte (R || S) Ed25519 signature.
+func (a *Agent) runSignFrost(ctx context.Context, session *Session, params *tss.Parameters, sh *store.Share, digest []byte) ([]byte, error) {
+	if sh.FrostKey == nil {
+		return nil, errors.New("sign: share missing frost key data")
+	}
+	sg, err := sh.FrostKey.NewSigning(ctx, digest, params)
+	if err != nil {
+		return nil, fmt.Errorf("frosttss signing start: %w", err)
+	}
 	select {
 	case sd := <-sg.Done:
 		session.finish(nil)
 		if sd == nil || len(sd.Signature) != 64 {
-			return nil, fmt.Errorf("sign: unexpected signature length %d", len(sd.Signature))
+			return nil, fmt.Errorf("sign: unexpected frost signature length %d", len(sd.Signature))
 		}
 		return sd.Signature, nil
 	case err := <-sg.Err:
+		session.finish(err)
+		return nil, err
+	case <-session.doneCh:
+		return nil, session.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// runSignDkls drives a DKLs23 ECDSA signing to completion. The result is the
+// 65-byte compact form `R || S || V` matching wdrone's reporting format —
+// ready for Ethereum-style recovery verifiers.
+func (a *Agent) runSignDkls(ctx context.Context, session *Session, params *tss.Parameters, sortedIDs tss.SortedPartyIDs, sh *store.Share, digest []byte) ([]byte, error) {
+	key, err := sh.LoadDkls()
+	if err != nil {
+		return nil, fmt.Errorf("sign: %w", err)
+	}
+	sp, err := dklstss.NewSigning(ctx, params, key, digest, sortedIDs, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dklstss signing start: %w", err)
+	}
+	select {
+	case s := <-sp.Done:
+		session.finish(nil)
+		r := bigIntToFixed(s.R, 32)
+		ss := bigIntToFixed(s.S, 32)
+		out := make([]byte, 0, 65)
+		out = append(out, r...)
+		out = append(out, ss...)
+		out = append(out, s.V)
+		return out, nil
+	case err := <-sp.Err:
 		session.finish(err)
 		return nil, err
 	case <-session.doneCh:

@@ -32,11 +32,12 @@ const (
 //	{
 //	  "sid":  "<crwsv-...>",
 //	  "type": "keygen" | "txsign",
-//	  "curve": "ed25519",
+//	  "curve": "ed25519" | "secp256k1",
+//	  "protocol": "frost" | "dkls23",
 //	  "threshold": 1,
 //	  "peers": [
 //	    {"spot_id": "k.<base64>", "moniker": "...",
-//	     "key": "<base64url Ed25519 pubkey>"}
+//	     "key": "<base64url pubkey bytes>"}
 //	  ],
 //	  "digest": "<base64 32 bytes, txsign only>"
 //	}
@@ -44,7 +45,11 @@ const (
 // The legacy `kind` and `wallet_id` aliases are tolerated for backward
 // compatibility with the original Stage-1 scaffolding. UnmarshalJSON coerces
 // `kind`/`type` into Kind and applies sensible defaults (curve=ed25519,
-// threshold=1) when the policy module omits them.
+// protocol=frost, threshold=1) when the policy module omits them.
+//
+// Legacy GG18 (`protocol == "legacy"` with curve `secp256k1`/`ed25519`) is
+// rejected by [resolveCurveProtocol] — clawdwallet only speaks the modern
+// FROST(Ed25519) and DKLs23(secp256k1) protocols.
 type InitPayload struct {
 	// Kind is the canonical session type ("keygen", "txsign", "reshare").
 	// Encoded as `type` on the wire; `kind` is accepted on input.
@@ -54,8 +59,13 @@ type InitPayload struct {
 	// payloads (the recipient also has it in the URL path).
 	SID string `json:"sid,omitempty"`
 
-	// Curve is "ed25519" for Stage 1.
+	// Curve is "ed25519" (default) or "secp256k1".
 	Curve string `json:"curve,omitempty"`
+
+	// Protocol selects the TSS algorithm: "frost" (Ed25519, default) or
+	// "dkls23" (secp256k1). May be omitted when the curve alone is
+	// unambiguous; see [resolveCurveProtocol].
+	Protocol string `json:"protocol,omitempty"`
 
 	// Peers is the full participant set (sorted by KeyInt before
 	// constructing tss PartyIDs).
@@ -80,12 +90,15 @@ type InitPayload struct {
 // UnmarshalJSON accepts the canonical `type` field as well as the original
 // `kind` alias used by the Stage-1 scaffolding. It also defaults Curve to
 // "ed25519" when absent, matching the policy module's omit-empty behaviour.
+// Protocol is left empty on input — the resolver in protocol.go derives it
+// from (curve, protocol) at dispatch time.
 func (ip *InitPayload) UnmarshalJSON(data []byte) error {
 	type raw struct {
 		Kind         SessionKind `json:"kind,omitempty"`
 		Type         SessionKind `json:"type,omitempty"`
 		SID          string      `json:"sid,omitempty"`
 		Curve        string      `json:"curve,omitempty"`
+		Protocol     string      `json:"protocol,omitempty"`
 		Peers        []PeerSpec  `json:"peers"`
 		Threshold    int         `json:"threshold,omitempty"`
 		Digest       string      `json:"digest,omitempty"`
@@ -109,8 +122,9 @@ func (ip *InitPayload) UnmarshalJSON(data []byte) error {
 	ip.SID = r.SID
 	ip.Curve = r.Curve
 	if ip.Curve == "" {
-		ip.Curve = "ed25519"
+		ip.Curve = CurveEd25519
 	}
+	ip.Protocol = r.Protocol
 	ip.Peers = r.Peers
 	ip.Threshold = r.Threshold
 	ip.Digest = r.Digest

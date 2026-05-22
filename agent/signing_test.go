@@ -45,6 +45,11 @@ func TestMarshalLeaderInit(t *testing.T) {
 	if got := m["type"]; got != "txsign" {
 		t.Fatalf("type: want txsign, got %v", got)
 	}
+	// Default leader path advertises the modern FROST protocol so the
+	// recipient (wdrone-compat) picks the right runner.
+	if got := m["protocol"]; got != "frost" {
+		t.Fatalf("protocol: want frost, got %v", got)
+	}
 
 	peers, ok := m["peers"].([]any)
 	if !ok {

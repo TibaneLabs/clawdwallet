@@ -7,10 +7,10 @@ import (
 
 // Reshare is Stage-2 functionality and is intentionally disabled in Stage 1.
 //
-// The previous implementation used the legacy `eddsa/keygen` + `eddsa/resharing`
-// outCh/endCh API of tss-lib v2.1.x. The Stage-1 transport rewrite moved the
-// agent to the broker/JsonMessage `eddsatss` API of v2.2.x, and porting the
-// reshare ceremony will be picked up alongside the wdrone-side reshare path.
+// When enabled it will dispatch on the loaded share's schema:
+//   - SchemaFrost  → frosttss.NewResharing
+//   - SchemaDkls23 → dklstss.NewResharing (with the joint ECDSAPub binding
+//     required for NEW-only committee members)
 //
 // The function is kept on the type so the `reshare` CLI command continues to
 // build; it returns an error at runtime instead of executing.

@@ -1,11 +1,18 @@
 // Package store persists the agent's TSS share to disk in encrypted form.
 //
 // The Spot identity itself lives in spotlib's own DiskStore (PEM key files).
-// Here we wrap the EdDSA keygen output in a gobottle so it never lands on
-// disk in cleartext.
+// Here we wrap the TSS keygen output in a gobottle so it never lands on disk
+// in cleartext.
+//
+// A persisted share carries a Schema discriminator (`frost` or `dkls23`) plus
+// exactly one populated key field. FROST produces a standard Ed25519
+// signature, so its public key is the wallet's Solana address. DKLs23
+// produces a standard secp256k1 ECDSA signature and is intended for
+// multi-chain custody (Ethereum, Bitcoin, …); it has no Solana address.
 package store
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"encoding/json"
@@ -17,18 +24,33 @@ import (
 
 	"github.com/BottleFmt/gobottle"
 	tsslibcrypto "github.com/KarpelesLab/tss-lib/v2/crypto"
-	"github.com/KarpelesLab/tss-lib/v2/eddsatss"
+	"github.com/KarpelesLab/tss-lib/v2/dklstss"
+	"github.com/KarpelesLab/tss-lib/v2/frosttss"
 	"github.com/fxamacker/cbor/v2"
 )
 
 const shareFile = "share.bottle"
 
-// Share holds the persisted EdDSA TSS keygen output for this party plus the metadata
-// needed to reconstruct signing parameters across restarts.
+// Schema values for Share.Schema.
+const (
+	SchemaFrost  = "frost"
+	SchemaDkls23 = "dkls23"
+)
+
+// Share holds the persisted TSS keygen output for this party plus the
+// metadata needed to reconstruct signing parameters across restarts.
+//
+// Exactly one of FrostKey / DklsBlob is populated, selected by Schema. The
+// peer table (PeerKeys / PeerSpotIDs / Threshold) and WalletID are common to
+// both schemas.
 type Share struct {
 	// WalletID identifies the wallet this share belongs to. In Stage 1 this
 	// is the server-issued crws- id (or the session id during initial keygen).
 	WalletID string `json:"wallet_id"`
+
+	// Schema discriminates the share's TSS protocol: SchemaFrost (Ed25519,
+	// Solana-compatible) or SchemaDkls23 (secp256k1, secondary chains).
+	Schema string `json:"schema"`
 
 	// PartyKey is the deterministic big.Int key used to construct this party's PartyID.
 	PartyKey *big.Int `json:"party_key,omitempty"`
@@ -43,28 +65,59 @@ type Share struct {
 	// Threshold is t in t-of-n. For 2-of-3, this is 1 (signing requires t+1=2).
 	Threshold int `json:"threshold"`
 
-	// EDKey is the raw eddsatss keygen output. Encoded as JSON. The eddsatss.Key
-	// type is JSON-compatible with the older eddsa/keygen.LocalPartySaveData
-	// shape, so on-disk shares written by either API decode to the same struct.
-	EDKey *eddsatss.Key `json:"save_data"`
+	// FrostKey is the FROST(Ed25519) keygen output. Populated when
+	// Schema == SchemaFrost. The struct is JSON-friendly: every field
+	// (including the *crypto.ECPoint commitments) has its own MarshalJSON.
+	FrostKey *frosttss.Key `json:"frost_key,omitempty"`
 
-	// PubKey is the aggregate EdDSA public key (32 bytes Ed25519 encoding).
-	// On Solana this is the wallet address.
-	PubKey []byte `json:"pub_key"`
+	// DklsBlob holds the dklstss.Key.Save() byte string verbatim. The
+	// dklstss key carries an elliptic.Curve interface plus per-pair OT
+	// extension state that does not round-trip through generic JSON, so we
+	// keep the protocol-defined serialisation and reconstruct via
+	// dklstss.Load on access. Populated when Schema == SchemaDkls23.
+	DklsBlob []byte `json:"dkls_blob,omitempty"`
+
+	// PubKey is the wallet's 32-byte Ed25519 public key (the Solana address)
+	// when Schema == SchemaFrost. Empty for SchemaDkls23.
+	PubKey []byte `json:"pub_key,omitempty"`
+
+	// Secp256k1Pub is the 33-byte SEC1-compressed secp256k1 public key when
+	// Schema == SchemaDkls23. Empty for SchemaFrost.
+	Secp256k1Pub []byte `json:"secp256k1_pub,omitempty"`
 }
 
-// SolanaAddressBytes returns the 32-byte representation of the aggregate public key,
-// which on Solana is the wallet address.
+// SolanaAddressBytes returns the 32-byte Ed25519 representation of the
+// aggregate public key — the Solana address — when this share is a FROST
+// share. Returns nil for DKLs23 shares, which have no Solana address.
 func (s *Share) SolanaAddressBytes() []byte {
+	if s.Schema != SchemaFrost {
+		return nil
+	}
 	if len(s.PubKey) == 32 {
 		out := make([]byte, 32)
 		copy(out, s.PubKey)
 		return out
 	}
-	if s.EDKey == nil || s.EDKey.EDDSAPub == nil {
+	if s.FrostKey == nil || s.FrostKey.GroupPublicKey == nil {
 		return nil
 	}
-	return EdPointBytes(s.EDKey.EDDSAPub)
+	return EdPointBytes(s.FrostKey.GroupPublicKey)
+}
+
+// LoadDkls reconstructs the dklstss.Key from DklsBlob. Returns an error if
+// the share is not a DKLs23 share or if the blob is missing/corrupt.
+//
+// The Key is read-only after reconstruction (sign / presign do not mutate
+// it), so callers may cache the result across signing rounds. See
+// dklstss/doc.go for the threading model.
+func (s *Share) LoadDkls() (*dklstss.Key, error) {
+	if s.Schema != SchemaDkls23 {
+		return nil, fmt.Errorf("share schema is %q, not %q", s.Schema, SchemaDkls23)
+	}
+	if len(s.DklsBlob) == 0 {
+		return nil, errors.New("dkls23 share has empty blob")
+	}
+	return dklstss.Load(bytes.NewReader(s.DklsBlob))
 }
 
 // EdPointBytes serializes an Ed25519 point to its 32-byte compressed form

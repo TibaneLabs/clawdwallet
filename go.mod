@@ -8,12 +8,13 @@ require (
 	github.com/KarpelesLab/rest v0.6.15
 	github.com/KarpelesLab/spotlib v0.3.0
 	github.com/KarpelesLab/spotproto v0.3.0
-	github.com/KarpelesLab/tss-lib/v2 v2.2.4
+	github.com/KarpelesLab/tss-lib/v2 v2.2.9
 	github.com/fxamacker/cbor/v2 v2.9.1
 	github.com/mdp/qrterminal/v3 v3.2.1
 )
 
 require (
+	filippo.io/edwards25519 v1.1.1 // indirect
 	github.com/KarpelesLab/base58 v1.1.1 // indirect
 	github.com/KarpelesLab/bech32m v0.1.5 // indirect
 	github.com/KarpelesLab/edwards25519 v1.1.7 // indirect
@@ -28,6 +29,7 @@ require (
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/ipfs/go-log v1.0.5 // indirect
 	github.com/ipfs/go-log/v2 v2.1.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
