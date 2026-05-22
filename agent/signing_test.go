@@ -132,3 +132,104 @@ func TestInitPayloadJSON(t *testing.T) {
 		t.Fatalf("legacy: Kind want txsign, got %q", ip2.Kind)
 	}
 }
+
+// TestInitPayloadJSON_Protocol verifies the `protocol` wire field is parsed
+// into InitPayload.Protocol and survives the UnmarshalJSON-applied defaults
+// (curve gets ed25519 when absent; protocol is left untouched for the
+// resolver to consume).
+func TestInitPayloadJSON_Protocol(t *testing.T) {
+	cases := []struct {
+		name, body, wantCurve, wantProto string
+	}{
+		{
+			name:      "frost explicit",
+			body:      `{"type":"keygen","curve":"ed25519","protocol":"frost","peers":[]}`,
+			wantCurve: "ed25519",
+			wantProto: "frost",
+		},
+		{
+			name:      "dkls23 explicit",
+			body:      `{"type":"keygen","curve":"secp256k1","protocol":"dkls23","peers":[]}`,
+			wantCurve: "secp256k1",
+			wantProto: "dkls23",
+		},
+		{
+			// Protocol omitted → kept empty; resolver fills it in at dispatch.
+			name:      "protocol omitted, curve default",
+			body:      `{"type":"keygen","peers":[]}`,
+			wantCurve: "ed25519",
+			wantProto: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ip InitPayload
+			if err := json.Unmarshal([]byte(tc.body), &ip); err != nil {
+				t.Fatalf("unmarshal: %s", err)
+			}
+			if ip.Curve != tc.wantCurve {
+				t.Errorf("curve: want %q got %q", tc.wantCurve, ip.Curve)
+			}
+			if ip.Protocol != tc.wantProto {
+				t.Errorf("protocol: want %q got %q", tc.wantProto, ip.Protocol)
+			}
+		})
+	}
+}
+
+// TestMarshalLeaderInitFor_Dkls23 asserts the DKLs23 dispatch path produces
+// a wdrone-compatible txsign init with the right (curve, protocol) pair —
+// the receiver runs the DKLs23 runner only when both fields match.
+func TestMarshalLeaderInitFor_Dkls23(t *testing.T) {
+	signers := []PeerSpec{
+		{SpotID: "k.agent", Moniker: "agent"},
+		{SpotID: "k.wdrone", Moniker: "wdrone"},
+	}
+	digest := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+		17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+	body, err := marshalLeaderInitFor("crwsv-eth", signers, signers[1], 1, digest,
+		CurveSecp256k1, ProtocolDkls23)
+	if err != nil {
+		t.Fatalf("marshalLeaderInitFor: %s", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("unmarshal: %s", err)
+	}
+	if got := m["curve"]; got != "secp256k1" {
+		t.Errorf("curve: want secp256k1, got %v", got)
+	}
+	if got := m["protocol"]; got != "dkls23" {
+		t.Errorf("protocol: want dkls23, got %v", got)
+	}
+	if got := m["type"]; got != "txsign" {
+		t.Errorf("type: want txsign, got %v", got)
+	}
+}
+
+// TestProtocolForSchema covers the share-schema → wire-fields mapping used
+// by SignDigest to fill the txsign init body.
+func TestProtocolForSchema(t *testing.T) {
+	cases := []struct {
+		schema, wantCurve, wantProto string
+		wantErr                      bool
+	}{
+		{"frost", "ed25519", "frost", false},
+		{"dkls23", "secp256k1", "dkls23", false},
+		{"", "", "", true},
+		{"legacy", "", "", true},
+		{"eddsa", "", "", true},
+	}
+	for _, tc := range cases {
+		c, p, err := protocolForSchema(tc.schema)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("schema %q: err=%v want_err=%v", tc.schema, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr {
+			if c != tc.wantCurve || p != tc.wantProto {
+				t.Errorf("schema %q: got (%q,%q) want (%q,%q)", tc.schema, c, p, tc.wantCurve, tc.wantProto)
+			}
+		}
+	}
+}
