@@ -9,10 +9,98 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/BottleFmt/gobottle"
 	"github.com/KarpelesLab/tss-lib/v2/dklstss"
 	"github.com/KarpelesLab/tss-lib/v2/frosttss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
+
+// testKeychain builds an in-memory keychain backed by a P-256 key, usable for
+// both the bottle's ECDH encryption and its signature.
+func testKeychain(t *testing.T) *gobottle.Keychain {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %s", err)
+	}
+	kc := gobottle.NewKeychain()
+	if err := kc.AddKey(priv); err != nil {
+		t.Fatalf("AddKey: %s", err)
+	}
+	return kc
+}
+
+func TestStoreSaveLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	kc := testKeychain(t)
+	st := New(dir, kc)
+
+	if st.Has() {
+		t.Errorf("Has should be false before Save")
+	}
+
+	priv, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+	priv.Add(priv, big.NewInt(1))
+	partyID := tss.NewPartyID("party-1", "party-1", big.NewInt(1))
+	fk, err := frosttss.ImportKey(priv, partyID)
+	if err != nil {
+		t.Fatalf("ImportKey: %s", err)
+	}
+	want := &Share{
+		WalletID:    "crws-roundtrip",
+		Schema:      SchemaFrost,
+		PeerKeys:    []*big.Int{big.NewInt(1), big.NewInt(2)},
+		PeerSpotIDs: []string{"k.a", "k.b"},
+		Threshold:   1,
+		FrostKey:    fk,
+		PubKey:      EdPointBytes(fk.GroupPublicKey),
+	}
+
+	if err := st.Save(want); err != nil {
+		t.Fatalf("Save: %s", err)
+	}
+	if !st.Has() {
+		t.Errorf("Has should be true after Save")
+	}
+
+	got, err := st.Load()
+	if err != nil {
+		t.Fatalf("Load: %s", err)
+	}
+	if got.WalletID != want.WalletID || got.Schema != SchemaFrost || got.Threshold != 1 {
+		t.Errorf("metadata diverged: %+v", got)
+	}
+	if got.FrostKey == nil || got.FrostKey.GroupPublicKey == nil {
+		t.Fatalf("frost key not preserved through bottle")
+	}
+	if !bytes.Equal(EdPointBytes(got.FrostKey.GroupPublicKey), EdPointBytes(fk.GroupPublicKey)) {
+		t.Errorf("GroupPublicKey diverged through bottle round-trip")
+	}
+	if len(got.PeerKeys) != 2 || got.PeerKeys[1].Int64() != 2 {
+		t.Errorf("peer keys diverged: %v", got.PeerKeys)
+	}
+}
+
+func TestStorePath(t *testing.T) {
+	st := New("/some/dir", nil)
+	if st.Path() == "" {
+		t.Errorf("Path should be non-empty")
+	}
+}
+
+func TestStoreSaveNilKeychain(t *testing.T) {
+	st := New(t.TempDir(), nil)
+	if err := st.Save(&Share{Schema: SchemaFrost}); err == nil {
+		t.Errorf("Save should error with a nil keychain")
+	}
+}
+
+func TestStoreLoadMissing(t *testing.T) {
+	st := New(t.TempDir(), testKeychain(t))
+	if _, err := st.Load(); err == nil {
+		t.Errorf("Load should error when no share file exists")
+	}
+}
 
 // TestShareJSONRoundTrip_Frost verifies that a SchemaFrost share survives a
 // JSON round-trip with the GroupPublicKey and peer table intact. The Save /

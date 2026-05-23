@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/base64"
+	"math/big"
 	"testing"
 )
 
@@ -34,5 +36,41 @@ func TestSortedPartyIDsOrder(t *testing.T) {
 		if a[i].Id != b[i].Id {
 			t.Fatalf("order mismatch at %d: %s vs %s", i, a[i].Id, b[i].Id)
 		}
+	}
+}
+
+func TestKeyIntFromKeyBytes(t *testing.T) {
+	raw := []byte{0x01, 0x02, 0x03, 0x04}
+	p := PeerSpec{SpotID: "k.x", Key: base64.RawURLEncoding.EncodeToString(raw)}
+	want := new(big.Int).SetBytes(raw)
+	if p.KeyInt().Cmp(want) != 0 {
+		t.Errorf("KeyInt from key bytes: want %s got %s", want, p.KeyInt())
+	}
+}
+
+func TestKeyIntFallback(t *testing.T) {
+	// No Key → sha256(spot_id) fallback. Must equal PartyKey(spot_id).
+	p := PeerSpec{SpotID: "k.fallback"}
+	if p.KeyInt().Cmp(PartyKey("k.fallback")) != 0 {
+		t.Errorf("KeyInt fallback should equal PartyKey(spot_id)")
+	}
+}
+
+func TestKeyBytes(t *testing.T) {
+	raw := []byte{0xaa, 0xbb}
+	p := PeerSpec{SpotID: "k.x", Key: base64.RawURLEncoding.EncodeToString(raw)}
+	if got := p.KeyBytes(); string(got) != string(raw) {
+		t.Errorf("KeyBytes: want %x got %x", raw, got)
+	}
+	pf := PeerSpec{SpotID: "k.y"}
+	if got := pf.KeyBytes(); string(got) != string(PartyKey("k.y").Bytes()) {
+		t.Errorf("KeyBytes fallback mismatch")
+	}
+}
+
+func TestPartyIDFromPeer(t *testing.T) {
+	pid := PartyIDFromPeer(PeerSpec{SpotID: "k.z", Moniker: "zed"})
+	if pid.Id != "k.z" || pid.Moniker != "zed" {
+		t.Errorf("PartyID: got id=%q moniker=%q", pid.Id, pid.Moniker)
 	}
 }
